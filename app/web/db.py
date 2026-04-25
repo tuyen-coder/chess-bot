@@ -11,6 +11,7 @@ DB_LOCK = threading.Lock()
 OPPONENTS = ["random", "minimax", "ml"]
 USERNAME_RE = re.compile(r"^[A-Za-z0-9_-]{3,24}$")
 MAX_PASSWORD_LENGTH = 128
+STARTING_ELO = 1200
 
 
 def get_connection():
@@ -25,16 +26,21 @@ def init_db():
         connection = get_connection()
         cursor = connection.cursor()
         cursor.execute(
-            """
+            f"""
             CREATE TABLE IF NOT EXISTS users (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 username TEXT NOT NULL UNIQUE,
                 password_hash TEXT NOT NULL,
                 password_salt TEXT NOT NULL,
+                elo INTEGER NOT NULL DEFAULT {STARTING_ELO},
+                multiplayer_wins INTEGER NOT NULL DEFAULT 0,
+                multiplayer_losses INTEGER NOT NULL DEFAULT 0,
+                multiplayer_draws INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
             )
             """
         )
+        ensure_user_columns(cursor)
         cursor.execute(
             """
             CREATE TABLE IF NOT EXISTS user_stats (
@@ -50,6 +56,20 @@ def init_db():
         )
         connection.commit()
         connection.close()
+
+
+def ensure_user_columns(cursor):
+    cursor.execute("PRAGMA table_info(users)")
+    columns = {row["name"] for row in cursor.fetchall()}
+    missing_columns = {
+        "elo": f"INTEGER NOT NULL DEFAULT {STARTING_ELO}",
+        "multiplayer_wins": "INTEGER NOT NULL DEFAULT 0",
+        "multiplayer_losses": "INTEGER NOT NULL DEFAULT 0",
+        "multiplayer_draws": "INTEGER NOT NULL DEFAULT 0",
+    }
+    for column, definition in missing_columns.items():
+        if column not in columns:
+            cursor.execute(f"ALTER TABLE users ADD COLUMN {column} {definition}")
 
 
 def hash_password(password, salt=None):
@@ -160,7 +180,16 @@ def get_user_auth(user_id):
         cursor = connection.cursor()
         cursor.execute(
             """
-            SELECT id, username, password_hash, password_salt, created_at
+            SELECT
+                id,
+                username,
+                password_hash,
+                password_salt,
+                elo,
+                multiplayer_wins,
+                multiplayer_losses,
+                multiplayer_draws,
+                created_at
             FROM users
             WHERE id = ?
             """,
@@ -181,6 +210,10 @@ def get_user(user_id):
     return {
         "id": row["id"],
         "username": row["username"],
+        "elo": row["elo"],
+        "multiplayer_wins": row["multiplayer_wins"],
+        "multiplayer_losses": row["multiplayer_losses"],
+        "multiplayer_draws": row["multiplayer_draws"],
         "created_at": row["created_at"],
     }
 
@@ -273,6 +306,103 @@ def get_user_stats(user_id):
         )
 
     return stats
+
+
+def get_leaderboard(limit=10):
+    safe_limit = max(1, min(int(limit), 50))
+    with DB_LOCK:
+        connection = get_connection()
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            SELECT id, username, elo, multiplayer_wins, multiplayer_losses, multiplayer_draws
+            FROM users
+            ORDER BY elo DESC, multiplayer_wins DESC, username ASC
+            LIMIT ?
+            """,
+            (safe_limit,),
+        )
+        rows = cursor.fetchall()
+        connection.close()
+
+    leaderboard = []
+    for index, row in enumerate(rows, start=1):
+        wins = row["multiplayer_wins"]
+        losses = row["multiplayer_losses"]
+        draws = row["multiplayer_draws"]
+        total = wins + losses + draws
+        leaderboard.append(
+            {
+                "rank": index,
+                "id": row["id"],
+                "username": row["username"],
+                "elo": row["elo"],
+                "wins": wins,
+                "losses": losses,
+                "draws": draws,
+                "games": total,
+            }
+        )
+    return leaderboard
+
+
+def expected_score(player_elo, opponent_elo):
+    return 1 / (1 + 10 ** ((opponent_elo - player_elo) / 400))
+
+
+def record_multiplayer_result(white_user_id, black_user_id, result):
+    if result not in {"white", "black", "draw"} or white_user_id == black_user_id:
+        return None
+
+    with DB_LOCK:
+        connection = get_connection()
+        cursor = connection.cursor()
+        cursor.execute(
+            "SELECT id, elo FROM users WHERE id IN (?, ?)",
+            (white_user_id, black_user_id),
+        )
+        rows = {row["id"]: row for row in cursor.fetchall()}
+        if white_user_id not in rows or black_user_id not in rows:
+            connection.close()
+            return None
+
+        white_elo = rows[white_user_id]["elo"]
+        black_elo = rows[black_user_id]["elo"]
+        if result == "white":
+            white_score = 1.0
+            black_score = 0.0
+            white_column = "multiplayer_wins"
+            black_column = "multiplayer_losses"
+        elif result == "black":
+            white_score = 0.0
+            black_score = 1.0
+            white_column = "multiplayer_losses"
+            black_column = "multiplayer_wins"
+        else:
+            white_score = 0.5
+            black_score = 0.5
+            white_column = "multiplayer_draws"
+            black_column = "multiplayer_draws"
+
+        k_factor = 32
+        white_new = round(white_elo + k_factor * (white_score - expected_score(white_elo, black_elo)))
+        black_new = round(black_elo + k_factor * (black_score - expected_score(black_elo, white_elo)))
+
+        cursor.execute(
+            f"UPDATE users SET elo = ?, {white_column} = {white_column} + 1 WHERE id = ?",
+            (white_new, white_user_id),
+        )
+        cursor.execute(
+            f"UPDATE users SET elo = ?, {black_column} = {black_column} + 1 WHERE id = ?",
+            (black_new, black_user_id),
+        )
+        connection.commit()
+        connection.close()
+
+    return {
+        "white": {"old": white_elo, "new": white_new, "change": white_new - white_elo},
+        "black": {"old": black_elo, "new": black_new, "change": black_new - black_elo},
+    }
 
 
 def record_result(user_id, opponent, result):

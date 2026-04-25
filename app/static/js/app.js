@@ -14,6 +14,7 @@ const PIECES = {
 };
 
 const MODES = [
+  ["Online Match", "online"],
   ["1. Player vs Player", "pvp"],
   ["2. Player vs Random AI", "pvr"],
   ["3. Player vs Minimax AI", "pvm"],
@@ -33,6 +34,7 @@ const app = document.getElementById("app");
 let state = null;
 let currentView = "auth";
 let aiLoopRunning = false;
+let onlineLoopRunning = false;
 let flash = null;
 
 function escapeHtml(value) {
@@ -70,6 +72,10 @@ function clearFlash() {
 function syncViewFromState() {
   if (!state?.user) {
     currentView = "auth";
+    return;
+  }
+  if (state.online) {
+    currentView = "online";
     return;
   }
   if (!["menu", "game", "profile"].includes(currentView)) {
@@ -113,6 +119,41 @@ function statsRows() {
       <td>${value.winRate}%</td>
     </tr>
   `).join("");
+}
+
+function leaderboardRows() {
+  const rows = state?.leaderboard || [];
+  if (!rows.length) {
+    return `<tr><td colspan="6">No rated games yet.</td></tr>`;
+  }
+  return rows.map((player) => `
+    <tr>
+      <td>${player.rank}</td>
+      <td>${escapeHtml(player.username)}</td>
+      <td>${player.elo}</td>
+      <td>${player.wins}</td>
+      <td>${player.losses}</td>
+      <td>${player.draws}</td>
+    </tr>
+  `).join("");
+}
+
+function renderLeaderboardTable() {
+  return `
+    <table class="stats-table">
+      <thead>
+        <tr>
+          <th>Rank</th>
+          <th>Player</th>
+          <th>Elo</th>
+          <th>Wins</th>
+          <th>Losses</th>
+          <th>Draws</th>
+        </tr>
+      </thead>
+      <tbody>${leaderboardRows()}</tbody>
+    </table>
+  `;
 }
 
 function renderAuthPage() {
@@ -228,6 +269,10 @@ function renderMenuPage() {
           <tbody>${statsRows()}</tbody>
         </table>
       </section>
+      <section class="card quick-stats">
+        <h2>Leaderboard</h2>
+        ${renderLeaderboardTable()}
+      </section>
       <section class="modes-grid">
         ${MODES.map(modeCard).join("")}
       </section>
@@ -238,6 +283,14 @@ function renderMenuPage() {
   app.querySelectorAll("[data-mode]").forEach((button) => {
     button.addEventListener("click", async () => {
       try {
+        if (button.dataset.mode === "online") {
+          state = await api("/api/matchmaking/join", { method: "POST" });
+          currentView = "online";
+          clearFlash();
+          render();
+          runOnlineLoopIfNeeded();
+          return;
+        }
         state = await api("/api/start", {
           method: "POST",
           body: { mode: button.dataset.mode },
@@ -322,7 +375,7 @@ function renderGamePage() {
           <div class="board-header">
             <div>
               <h1>Match Board</h1>
-              <p class="muted">${state.modeLabel}</p>
+              <p class="muted">${escapeHtml(state.modeLabel)}${state.playerColor ? ` - You are ${escapeHtml(state.playerColor)}` : ""}</p>
             </div>
             <button class="secondary-button" id="back-button">Back to Menu</button>
           </div>
@@ -341,6 +394,8 @@ function renderGamePage() {
           <section class="card">
             <h2>Overview</h2>
             <div class="info-row"><span class="muted">Mode</span><span>${escapeHtml(state.modeLabel)}</span></div>
+            ${state.opponent ? `<div class="info-row"><span class="muted">Opponent</span><span>${escapeHtml(state.opponent.username)}</span></div>` : ""}
+            ${state.playerColor ? `<div class="info-row"><span class="muted">Color</span><span>${escapeHtml(state.playerColor)}</span></div>` : ""}
             <div class="info-row"><span class="muted">Turn</span><span>${escapeHtml(state.turn)}</span></div>
             <div class="info-row"><span class="muted">Status</span><span class="status-pill">${escapeHtml(state.status)}</span></div>
             <div class="info-row"><span class="muted">Last move</span><span>${escapeHtml(state.lastMove)}</span></div>
@@ -356,6 +411,7 @@ function renderGamePage() {
           <section class="card">
             <h2>Account</h2>
             <div class="info-row"><span class="muted">Player</span><span>${escapeHtml(state.user.username)}</span></div>
+            <div class="info-row"><span class="muted">Elo</span><span>${state.user.elo}</span></div>
             <div class="info-row"><span class="muted">Profile</span><span>View stats and update username/password from the profile page.</span></div>
           </section>
 
@@ -371,7 +427,7 @@ function renderGamePage() {
   bindAuthenticatedNav();
 
   document.getElementById("back-button").addEventListener("click", async () => {
-    state = await api("/api/menu", { method: "POST" });
+    state = await api(state.online ? "/api/matchmaking/leave" : "/api/menu", { method: "POST" });
     currentView = "menu";
     clearFlash();
     render();
@@ -381,7 +437,7 @@ function renderGamePage() {
     square.addEventListener("click", async () => {
       if (!state.canInteract) return;
       try {
-        state = await api("/api/click", {
+        state = await api(state.online ? "/api/matchmaking/click" : "/api/click", {
           method: "POST",
           body: {
             row: Number(square.dataset.row),
@@ -390,11 +446,46 @@ function renderGamePage() {
         });
         clearFlash();
         render();
-        runAiLoopIfNeeded();
+        if (state.online) {
+          runOnlineLoopIfNeeded();
+        } else {
+          runAiLoopIfNeeded();
+        }
       } catch (error) {
         setFlash(error.message, "error");
       }
     });
+  });
+}
+
+function renderWaitingPage() {
+  app.innerHTML = `
+    <main class="page page-medium">
+      ${renderTopNav()}
+      ${renderFlash()}
+      <section class="hero">
+        <h1>Online Match</h1>
+        <p>${escapeHtml(state.status || "Waiting for another player")}</p>
+      </section>
+      <section class="card">
+        <h2>Queue</h2>
+        <div class="info-row"><span class="muted">Player</span><span>${escapeHtml(state.user.username)}</span></div>
+        <div class="info-row"><span class="muted">Elo</span><span>${state.user.elo}</span></div>
+        <button class="secondary-button" id="leave-queue-button">Leave Queue</button>
+      </section>
+      <section class="card leaderboard-card">
+        <h2>Leaderboard</h2>
+        ${renderLeaderboardTable()}
+      </section>
+    </main>
+  `;
+
+  bindAuthenticatedNav();
+  document.getElementById("leave-queue-button").addEventListener("click", async () => {
+    state = await api("/api/matchmaking/leave", { method: "POST" });
+    currentView = "menu";
+    clearFlash();
+    render();
   });
 }
 
@@ -412,7 +503,14 @@ function renderProfilePage() {
         <section class="card">
           <h2>Account Details</h2>
           <div class="info-row"><span class="muted">Username</span><span>${escapeHtml(state.user.username)}</span></div>
+          <div class="info-row"><span class="muted">Elo</span><span>${state.user.elo}</span></div>
+          <div class="info-row"><span class="muted">Online</span><span>${state.user.multiplayer_wins}W ${state.user.multiplayer_losses}L ${state.user.multiplayer_draws}D</span></div>
           <div class="info-row"><span class="muted">Created</span><span>${escapeHtml(state.user.created_at || "Unknown")}</span></div>
+        </section>
+
+        <section class="card">
+          <h2>Leaderboard</h2>
+          ${renderLeaderboardTable()}
         </section>
 
         <section class="card">
@@ -527,6 +625,14 @@ function render() {
     renderProfilePage();
     return;
   }
+  if (currentView === "online") {
+    if (state.waitingForOpponent) {
+      renderWaitingPage();
+    } else {
+      renderGamePage();
+    }
+    return;
+  }
   if (currentView === "game" && !state.inMenu) {
     renderGamePage();
     return;
@@ -558,11 +664,41 @@ async function runAiLoopIfNeeded() {
   }
 }
 
+async function runOnlineLoopIfNeeded() {
+  if (onlineLoopRunning || !state || !state.online || state.gameOver) {
+    return;
+  }
+
+  onlineLoopRunning = true;
+
+  try {
+    while (state && state.online && !state.gameOver) {
+      await new Promise((resolve) => setTimeout(resolve, 1200));
+      state = await api("/api/matchmaking/state", { method: "POST" });
+      render();
+      if (!state.online || state.gameOver) {
+        break;
+      }
+    }
+    if (state?.gameOver) {
+      setFlash(state.gameResult || "Game finished.", "success");
+    }
+  } catch (error) {
+    setFlash(error.message, "error");
+  } finally {
+    onlineLoopRunning = false;
+  }
+}
+
 async function bootstrap() {
   state = await api("/api/state");
   syncViewFromState();
   render();
-  runAiLoopIfNeeded();
+  if (state.online) {
+    runOnlineLoopIfNeeded();
+  } else {
+    runAiLoopIfNeeded();
+  }
 }
 
 bootstrap().catch((error) => {

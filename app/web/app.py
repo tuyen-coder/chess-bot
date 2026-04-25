@@ -29,6 +29,7 @@ SESSION_MAX_AGE = 60 * 60 * 12
 
 MODE_LABELS = {
     "pvp": "Player vs Player",
+    "online": "Online Match",
     "pvr": "Player vs Random AI",
     "pvm": "Player vs Minimax AI",
     "rvm": "Random AI vs Minimax AI",
@@ -49,6 +50,22 @@ SECURITY_HEADERS = {
     "Referrer-Policy": "no-referrer",
     "Content-Security-Policy": "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'",
 }
+
+
+def describe_piece_code(piece_code):
+    if piece_code == "--":
+        return "empty"
+
+    color = "White" if piece_code[0] == "w" else "Black"
+    names = {
+        "p": "pawn",
+        "R": "rook",
+        "N": "knight",
+        "B": "bishop",
+        "Q": "queen",
+        "K": "king",
+    }
+    return f"{color} {names.get(piece_code[1], 'piece')}"
 
 
 class RateLimiter:
@@ -198,19 +215,7 @@ class WebChessController:
         self.result_recorded = True
 
     def describe_piece(self, piece_code):
-        if piece_code == "--":
-            return "empty"
-
-        color = "White" if piece_code[0] == "w" else "Black"
-        names = {
-            "p": "pawn",
-            "R": "rook",
-            "N": "knight",
-            "B": "bishop",
-            "Q": "queen",
-            "K": "king",
-        }
-        return f"{color} {names.get(piece_code[1], 'piece')}"
+        return describe_piece_code(piece_code)
 
     def selection_payload(self):
         if self.selected is None:
@@ -248,6 +253,7 @@ class WebChessController:
             "inMenu": self.mode is None,
             "user": user,
             "stats": stats,
+            "leaderboard": web_db.get_leaderboard(),
             "mode": self.mode,
             "modeLabel": MODE_LABELS.get(self.mode, "Not selected"),
             "board": self.game_state.board_to_array(),
@@ -271,12 +277,180 @@ class WebChessController:
 web_db.init_db()
 SESSIONS = {}
 SESSIONS_LOCK = threading.Lock()
+MATCHES = {}
+MATCH_QUEUE = []
+MATCH_LOCK = threading.Lock()
 
 
 class SessionState:
     def __init__(self):
         self.controller = WebChessController()
         self.user_id = None
+        self.online_match_id = None
+
+
+class OnlineMatch:
+    def __init__(self, match_id, white_user_id, black_user_id):
+        self.id = match_id
+        self.game_state = chess_engine.GameState()
+        self.players = {
+            chess.WHITE: white_user_id,
+            chess.BLACK: black_user_id,
+        }
+        self.selected = {
+            white_user_id: None,
+            black_user_id: None,
+        }
+        self.legal_moves = {
+            white_user_id: [],
+            black_user_id: [],
+        }
+        self.result_recorded = False
+        self.elo_change = None
+        self.created_at = time.time()
+        self.lock = threading.Lock()
+
+    def user_color(self, user_id):
+        if self.players[chess.WHITE] == user_id:
+            return chess.WHITE
+        if self.players[chess.BLACK] == user_id:
+            return chess.BLACK
+        return None
+
+    def opponent_id(self, user_id):
+        color = self.user_color(user_id)
+        if color is None:
+            return None
+        return self.players[not color]
+
+    def color_name(self, color):
+        return "White" if color == chess.WHITE else "Black"
+
+    def can_interact(self, user_id):
+        color = self.user_color(user_id)
+        return (
+            color is not None
+            and not self.game_state.is_game_over()
+            and self.game_state.board.turn == color
+        )
+
+    def selection_payload(self, user_id):
+        selected = self.selected.get(user_id)
+        legal_moves = self.legal_moves.get(user_id, [])
+        if selected is None:
+            return {
+                "square": "No piece selected",
+                "piece": "",
+                "legalMovesText": "Click one of your pieces to preview legal moves.",
+            }
+
+        piece_code = self.game_state.board_to_array()[selected[0]][selected[1]]
+        moves = [self.game_state.rc_to_algebraic(move) for move in legal_moves]
+        return {
+            "square": self.game_state.rc_to_algebraic(selected),
+            "piece": describe_piece_code(piece_code),
+            "legalMovesText": ", ".join(moves) if moves else "No legal moves available from this square.",
+        }
+
+    def describe_status(self):
+        if self.game_state.is_checkmate():
+            return self.game_state.game_result()
+        if self.game_state.is_stalemate():
+            return "Stalemate"
+        if self.game_state.is_check():
+            return "Check"
+        return "In progress"
+
+    def result_key(self):
+        if not self.game_state.is_game_over():
+            return None
+        if self.game_state.board.is_checkmate():
+            return "black" if self.game_state.board.turn == chess.WHITE else "white"
+        return "draw"
+
+    def maybe_record_result(self):
+        result = self.result_key()
+        if self.result_recorded or result is None:
+            return
+        self.elo_change = web_db.record_multiplayer_result(
+            self.players[chess.WHITE],
+            self.players[chess.BLACK],
+            result,
+        )
+        self.result_recorded = True
+
+    def piece_belongs_to_user(self, row, col, user_id):
+        color = self.user_color(user_id)
+        if color is None:
+            return False
+        square = chess.square(col, 7 - row)
+        piece = self.game_state.board.piece_at(square)
+        return piece is not None and piece.color == color
+
+    def click_square(self, user_id, row, col):
+        if not self.can_interact(user_id):
+            return
+
+        selected = self.selected[user_id]
+        if selected is None:
+            if self.piece_belongs_to_user(row, col, user_id):
+                moves = self.game_state.legal_moves_from(row, col)
+                self.selected[user_id] = (row, col) if moves else None
+                self.legal_moves[user_id] = moves
+            return
+
+        moved = self.game_state.make_move(selected, (row, col))
+        if moved:
+            for player_id in self.selected:
+                self.selected[player_id] = None
+                self.legal_moves[player_id] = []
+            self.maybe_record_result()
+            return
+
+        if self.piece_belongs_to_user(row, col, user_id):
+            moves = self.game_state.legal_moves_from(row, col)
+            self.selected[user_id] = (row, col) if moves else None
+            self.legal_moves[user_id] = moves
+        else:
+            self.selected[user_id] = None
+            self.legal_moves[user_id] = []
+
+    def state(self, user_id):
+        color = self.user_color(user_id)
+        opponent = web_db.get_user(self.opponent_id(user_id))
+        user = web_db.get_user(user_id)
+        check_square = self.game_state.king_in_check_rc()
+        selection = self.selection_payload(user_id)
+        self.maybe_record_result()
+        return {
+            "inMenu": False,
+            "online": True,
+            "matchId": self.id,
+            "user": user,
+            "opponent": opponent,
+            "stats": web_db.get_user_stats(user_id),
+            "leaderboard": web_db.get_leaderboard(),
+            "mode": "online",
+            "modeLabel": "Online Match",
+            "playerColor": self.color_name(color) if color is not None else None,
+            "board": self.game_state.board_to_array(),
+            "selected": list(self.selected.get(user_id)) if self.selected.get(user_id) else None,
+            "legalMoves": [list(move) for move in self.legal_moves.get(user_id, [])],
+            "checkSquare": list(check_square) if check_square else None,
+            "turn": "White" if self.game_state.board.turn == chess.WHITE else "Black",
+            "status": self.describe_status(),
+            "lastMove": self.game_state.moveLog[-1] if self.game_state.moveLog else "No moves yet",
+            "moveCount": len(self.game_state.moveLog),
+            "moveLog": self.game_state.moveLog,
+            "selection": selection,
+            "selectionDisplay": f"{selection['square']} ({selection['piece']})" if selection["piece"] else selection["square"],
+            "gameOver": self.game_state.is_game_over(),
+            "gameResult": self.game_state.game_result() if self.game_state.is_game_over() else None,
+            "canInteract": self.can_interact(user_id),
+            "aiWaiting": False,
+            "aiDelayMs": AI_DELAY_MS,
+            "eloChange": self.elo_change,
+        }
 
 
 def create_session():
@@ -295,6 +469,69 @@ def rotate_session(previous_token=None, session=None):
             session = SessionState()
         SESSIONS[token] = session
     return token, session
+
+
+def waiting_state(user_id):
+    return {
+        "inMenu": False,
+        "online": True,
+        "waitingForOpponent": True,
+        "user": web_db.get_user(user_id),
+        "stats": web_db.get_user_stats(user_id),
+        "leaderboard": web_db.get_leaderboard(),
+        "mode": "online",
+        "modeLabel": "Online Match",
+        "status": "Waiting for another player",
+        "gameOver": False,
+        "canInteract": False,
+        "aiWaiting": False,
+    }
+
+
+def leave_matchmaking(user_id):
+    if user_id is None:
+        return
+    with MATCH_LOCK:
+        while user_id in MATCH_QUEUE:
+            MATCH_QUEUE.remove(user_id)
+
+
+def join_matchmaking(user_id):
+    with MATCH_LOCK:
+        for match in MATCHES.values():
+            if user_id in match.players.values() and not match.game_state.is_game_over():
+                return match
+
+        while user_id in MATCH_QUEUE:
+            MATCH_QUEUE.remove(user_id)
+
+        if MATCH_QUEUE:
+            opponent_id = MATCH_QUEUE.pop(0)
+            match_id = uuid4().hex
+            match = OnlineMatch(match_id, opponent_id, user_id)
+            MATCHES[match_id] = match
+            return match
+
+        MATCH_QUEUE.append(user_id)
+        return None
+
+
+def get_active_match(match_id, user_id):
+    if not match_id:
+        return None
+    with MATCH_LOCK:
+        match = MATCHES.get(match_id)
+        if match and user_id in match.players.values():
+            return match
+    return None
+
+
+def find_user_match(user_id):
+    with MATCH_LOCK:
+        for match in MATCHES.values():
+            if user_id in match.players.values() and not match.game_state.is_game_over():
+                return match
+    return None
 
 
 class ChessRequestHandler(BaseHTTPRequestHandler):
@@ -369,7 +606,15 @@ class ChessRequestHandler(BaseHTTPRequestHandler):
         if path == "/static/js/app.js":
             return self.serve_static("js/app.js", "application/javascript; charset=utf-8")
         if path == "/api/state":
+            if session.user_id is not None:
+                match = get_active_match(session.online_match_id, session.user_id) or find_user_match(session.user_id)
+                if match:
+                    session.online_match_id = match.id
+                    with match.lock:
+                        return self.send_json(match.state(session.user_id))
             return self.send_json(session.controller.state(session.user_id))
+        if path == "/api/leaderboard":
+            return self.send_json({"leaderboard": web_db.get_leaderboard()})
 
         self.send_error(HTTPStatus.NOT_FOUND, "Not found")
 
@@ -405,6 +650,7 @@ class ChessRequestHandler(BaseHTTPRequestHandler):
             return self.send_json(session.controller.state(session.user_id))
 
         if path == "/api/logout":
+            leave_matchmaking(session.user_id)
             self.destroy_session(session_token)
             new_token, session = create_session()
             self.pending_session_token = new_token
@@ -441,12 +687,43 @@ class ChessRequestHandler(BaseHTTPRequestHandler):
             mode = payload.get("mode")
             if mode not in MODE_LABELS:
                 return self.send_json({"error": "Invalid mode"}, status=HTTPStatus.BAD_REQUEST)
+            leave_matchmaking(session.user_id)
+            session.online_match_id = None
             session.controller.start_game(mode)
             session.controller.maybe_record_result(session.user_id)
             return self.send_json(session.controller.state(session.user_id))
 
         if path == "/api/menu":
+            leave_matchmaking(session.user_id)
+            session.online_match_id = None
             session.controller.go_to_menu()
+            return self.send_json(session.controller.state(session.user_id))
+
+        if path == "/api/matchmaking/join":
+            match = join_matchmaking(session.user_id)
+            if match is None:
+                session.online_match_id = None
+                return self.send_json(waiting_state(session.user_id))
+            session.online_match_id = match.id
+            with match.lock:
+                return self.send_json(match.state(session.user_id))
+
+        if path == "/api/matchmaking/leave":
+            leave_matchmaking(session.user_id)
+            session.online_match_id = None
+            session.controller.go_to_menu()
+            return self.send_json(session.controller.state(session.user_id))
+
+        if path == "/api/matchmaking/state":
+            match = get_active_match(session.online_match_id, session.user_id) or find_user_match(session.user_id)
+            if match:
+                session.online_match_id = match.id
+                with match.lock:
+                    return self.send_json(match.state(session.user_id))
+            with MATCH_LOCK:
+                waiting = session.user_id in MATCH_QUEUE
+            if waiting:
+                return self.send_json(waiting_state(session.user_id))
             return self.send_json(session.controller.state(session.user_id))
 
         if path == "/api/click":
@@ -459,6 +736,20 @@ class ChessRequestHandler(BaseHTTPRequestHandler):
             session.controller.click_square(row, col)
             session.controller.maybe_record_result(session.user_id)
             return self.send_json(session.controller.state(session.user_id))
+
+        if path == "/api/matchmaking/click":
+            match = get_active_match(session.online_match_id, session.user_id)
+            if match is None:
+                return self.send_json({"error": "No active online match."}, status=HTTPStatus.BAD_REQUEST)
+            row = payload.get("row")
+            col = payload.get("col")
+            if not isinstance(row, int) or not isinstance(col, int):
+                return self.send_json({"error": "Invalid square"}, status=HTTPStatus.BAD_REQUEST)
+            if not (0 <= row < 8 and 0 <= col < 8):
+                return self.send_json({"error": "Square is out of range."}, status=HTTPStatus.BAD_REQUEST)
+            with match.lock:
+                match.click_square(session.user_id, row, col)
+                return self.send_json(match.state(session.user_id))
 
         if path == "/api/ai-step":
             session.controller.ai_step()
