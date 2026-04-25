@@ -1,5 +1,7 @@
 import hashlib
+import hmac
 import os
+import re
 import sqlite3
 import threading
 from pathlib import Path
@@ -7,11 +9,14 @@ from pathlib import Path
 DB_PATH = Path(__file__).resolve().parents[1] / "data" / "chess_web.db"
 DB_LOCK = threading.Lock()
 OPPONENTS = ["random", "minimax", "ml"]
+USERNAME_RE = re.compile(r"^[A-Za-z0-9_-]{3,24}$")
+MAX_PASSWORD_LENGTH = 128
 
 
 def get_connection():
     connection = sqlite3.connect(DB_PATH)
     connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA foreign_keys = ON")
     return connection
 
 
@@ -59,23 +64,28 @@ def hash_password(password, salt=None):
 
 
 def normalize_username(username):
-    normalized = (username or "").strip()
-    if len(normalized) < 3:
-        raise ValueError("Username must be at least 3 characters.")
+    if not isinstance(username, str):
+        raise ValueError("Username is required.")
+
+    normalized = username.strip()
+    if not USERNAME_RE.fullmatch(normalized):
+        raise ValueError("Username must be 3-24 characters using letters, numbers, _ or -.")
     return normalized
 
 
 def validate_password(password):
-    if not password:
+    if not isinstance(password, str) or not password:
         raise ValueError("Password is required.")
-    if len(password) < 6:
-        raise ValueError("Password must be at least 6 characters.")
+    if len(password) < 8:
+        raise ValueError("Password must be at least 8 characters.")
+    if len(password) > MAX_PASSWORD_LENGTH:
+        raise ValueError("Password is too long.")
     return password
 
 
 def verify_password(password, password_hash, password_salt):
     candidate_hash, _ = hash_password(password, salt=bytes.fromhex(password_salt))
-    return candidate_hash == password_hash
+    return hmac.compare_digest(candidate_hash, password_hash)
 
 
 def create_user(username, password):
@@ -269,25 +279,38 @@ def record_result(user_id, opponent, result):
     if opponent not in OPPONENTS:
         return
 
-    column = {
-        "win": "wins",
-        "loss": "losses",
-        "draw": "draws",
-    }.get(result)
-
-    if column is None:
+    if result not in {"win", "loss", "draw"}:
         return
 
     with DB_LOCK:
         connection = get_connection()
         cursor = connection.cursor()
-        cursor.execute(
-            f"""
-            UPDATE user_stats
-            SET {column} = {column} + 1
-            WHERE user_id = ? AND opponent = ?
-            """,
-            (user_id, opponent),
-        )
+        if result == "win":
+            cursor.execute(
+                """
+                UPDATE user_stats
+                SET wins = wins + 1
+                WHERE user_id = ? AND opponent = ?
+                """,
+                (user_id, opponent),
+            )
+        elif result == "loss":
+            cursor.execute(
+                """
+                UPDATE user_stats
+                SET losses = losses + 1
+                WHERE user_id = ? AND opponent = ?
+                """,
+                (user_id, opponent),
+            )
+        else:
+            cursor.execute(
+                """
+                UPDATE user_stats
+                SET draws = draws + 1
+                WHERE user_id = ? AND opponent = ?
+                """,
+                (user_id, opponent),
+            )
         connection.commit()
         connection.close()

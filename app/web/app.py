@@ -1,5 +1,8 @@
 import json
 import threading
+import time
+from collections import defaultdict, deque
+from http import cookies
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -20,6 +23,9 @@ MINIMAX_DEPTH = 3
 CHESS_TURN = chess.WHITE
 TEMPLATE_DIR = Path(__file__).resolve().parent / "templates"
 STATIC_DIR = Path(__file__).resolve().parents[1] / "static"
+MAX_JSON_BYTES = 8 * 1024
+SESSION_COOKIE_NAME = "chess_session"
+SESSION_MAX_AGE = 60 * 60 * 12
 
 MODE_LABELS = {
     "pvp": "Player vs Player",
@@ -36,6 +42,37 @@ PLAYER_MODES = {
     "pvm": "minimax",
     "pvl": "ml",
 }
+
+SECURITY_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "no-referrer",
+    "Content-Security-Policy": "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'",
+}
+
+
+class RateLimiter:
+    def __init__(self, limit, window_seconds):
+        self.limit = limit
+        self.window_seconds = window_seconds
+        self.events = defaultdict(deque)
+        self.lock = threading.Lock()
+
+    def allow(self, key):
+        now = time.time()
+        cutoff = now - self.window_seconds
+        with self.lock:
+            queue = self.events[key]
+            while queue and queue[0] < cutoff:
+                queue.popleft()
+            if len(queue) >= self.limit:
+                return False
+            queue.append(now)
+            return True
+
+
+AUTH_RATE_LIMITER = RateLimiter(limit=10, window_seconds=5 * 60)
+PASSWORD_RATE_LIMITER = RateLimiter(limit=8, window_seconds=10 * 60)
 
 
 class WebChessController:
@@ -249,19 +286,34 @@ def create_session():
     return token, SESSIONS[token]
 
 
+def rotate_session(previous_token=None, session=None):
+    token = uuid4().hex
+    with SESSIONS_LOCK:
+        if previous_token:
+            SESSIONS.pop(previous_token, None)
+        if session is None:
+            session = SessionState()
+        SESSIONS[token] = session
+    return token, session
+
+
 class ChessRequestHandler(BaseHTTPRequestHandler):
     server_version = "ChessWeb/1.0"
 
     def get_or_create_session(self):
         self.pending_session_token = None
-        cookie_header = self.headers.get("Cookie", "")
+        self.clear_session_cookie = False
         session_token = None
 
-        for cookie in cookie_header.split(";"):
-            cookie = cookie.strip()
-            if cookie.startswith("chess_session="):
-                session_token = cookie.split("=", 1)[1]
-                break
+        cookie_header = self.headers.get("Cookie")
+        if cookie_header:
+            try:
+                jar = cookies.SimpleCookie()
+                jar.load(cookie_header)
+                morsel = jar.get(SESSION_COOKIE_NAME)
+                session_token = morsel.value if morsel else None
+            except cookies.CookieError:
+                session_token = None
 
         with SESSIONS_LOCK:
             if session_token and session_token in SESSIONS:
@@ -270,6 +322,41 @@ class ChessRequestHandler(BaseHTTPRequestHandler):
         token, session = create_session()
         self.pending_session_token = token
         return token, session
+
+    def send_security_headers(self):
+        for name, value in SECURITY_HEADERS.items():
+            self.send_header(name, value)
+
+    def send_no_store_headers(self):
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Pragma", "no-cache")
+
+    def request_origin_allowed(self):
+        origin = self.headers.get("Origin")
+        if not origin:
+            return True
+        allowed = {
+            f"http://{self.headers.get('Host')}",
+            f"http://{HOST}:{PORT}",
+            f"http://localhost:{PORT}",
+            f"http://127.0.0.1:{PORT}",
+        }
+        return origin in allowed
+
+    def rotate_authenticated_session(self, current_token, session, user_id=None):
+        if user_id is not None:
+            session.user_id = user_id
+        new_token, _ = rotate_session(previous_token=current_token, session=session)
+        self.pending_session_token = new_token
+
+    def destroy_session(self, current_token):
+        with SESSIONS_LOCK:
+            SESSIONS.pop(current_token, None)
+        self.clear_session_cookie = True
+
+    def limited(self, limiter, bucket):
+        client_ip = self.client_address[0] if self.client_address else "unknown"
+        return not limiter.allow(f"{bucket}:{client_ip}")
 
     def do_GET(self):
         path = urlparse(self.path).path
@@ -287,29 +374,40 @@ class ChessRequestHandler(BaseHTTPRequestHandler):
         self.send_error(HTTPStatus.NOT_FOUND, "Not found")
 
     def do_POST(self):
+        if not self.request_origin_allowed():
+            return self.send_json({"error": "Invalid request origin."}, status=HTTPStatus.FORBIDDEN)
+
         path = urlparse(self.path).path
-        payload = self.read_json()
-        _, session = self.get_or_create_session()
+        try:
+            payload = self.read_json()
+        except ValueError as exc:
+            return self.send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+        session_token, session = self.get_or_create_session()
 
         if path == "/api/register":
+            if self.limited(AUTH_RATE_LIMITER, "register"):
+                return self.send_json({"error": "Too many registration attempts. Please wait and try again."}, status=HTTPStatus.TOO_MANY_REQUESTS)
             try:
                 user = web_db.create_user(payload.get("username", "").strip(), payload.get("password", ""))
             except ValueError as exc:
                 return self.send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
-            session.user_id = user["id"]
+            self.rotate_authenticated_session(session_token, session, user_id=user["id"])
             return self.send_json(session.controller.state(session.user_id))
 
         if path == "/api/login":
+            if self.limited(AUTH_RATE_LIMITER, "login"):
+                return self.send_json({"error": "Too many login attempts. Please wait and try again."}, status=HTTPStatus.TOO_MANY_REQUESTS)
             try:
                 user = web_db.verify_user(payload.get("username", "").strip(), payload.get("password", ""))
             except ValueError as exc:
                 return self.send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
-            session.user_id = user["id"]
+            self.rotate_authenticated_session(session_token, session, user_id=user["id"])
             return self.send_json(session.controller.state(session.user_id))
 
         if path == "/api/logout":
-            session.user_id = None
-            session.controller.go_to_menu()
+            self.destroy_session(session_token)
+            new_token, session = create_session()
+            self.pending_session_token = new_token
             return self.send_json(session.controller.state())
 
         if path == "/api/profile/username":
@@ -324,6 +422,8 @@ class ChessRequestHandler(BaseHTTPRequestHandler):
         if path == "/api/profile/password":
             if session.user_id is None:
                 return self.send_json({"error": "Please log in first."}, status=HTTPStatus.UNAUTHORIZED)
+            if self.limited(PASSWORD_RATE_LIMITER, "profile-password"):
+                return self.send_json({"error": "Too many password change attempts. Please wait and try again."}, status=HTTPStatus.TOO_MANY_REQUESTS)
             try:
                 web_db.update_password(
                     session.user_id,
@@ -354,6 +454,8 @@ class ChessRequestHandler(BaseHTTPRequestHandler):
             col = payload.get("col")
             if not isinstance(row, int) or not isinstance(col, int):
                 return self.send_json({"error": "Invalid square"}, status=HTTPStatus.BAD_REQUEST)
+            if not (0 <= row < 8 and 0 <= col < 8):
+                return self.send_json({"error": "Square is out of range."}, status=HTTPStatus.BAD_REQUEST)
             session.controller.click_square(row, col)
             session.controller.maybe_record_result(session.user_id)
             return self.send_json(session.controller.state(session.user_id))
@@ -366,13 +468,24 @@ class ChessRequestHandler(BaseHTTPRequestHandler):
         self.send_error(HTTPStatus.NOT_FOUND, "Not found")
 
     def read_json(self):
+        if self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower() != "application/json":
+            raise ValueError("Content-Type must be application/json.")
+
         content_length = int(self.headers.get("Content-Length", "0"))
+        if content_length > MAX_JSON_BYTES:
+            raise ValueError("Request body is too large.")
         if content_length == 0:
             return {}
         raw = self.rfile.read(content_length)
         if not raw:
             return {}
-        return json.loads(raw.decode("utf-8"))
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("Invalid JSON body.") from exc
+        if not isinstance(payload, dict):
+            raise ValueError("JSON body must be an object.")
+        return payload
 
     def serve_static(self, filename, content_type):
         if filename == "index.html":
@@ -385,8 +498,11 @@ class ChessRequestHandler(BaseHTTPRequestHandler):
 
         content = file_path.read_bytes()
         self.send_response(HTTPStatus.OK)
+        self.send_security_headers()
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(content)))
+        if filename == "index.html":
+            self.send_no_store_headers()
         self.maybe_set_session_cookie()
         self.end_headers()
         self.wfile.write(content)
@@ -394,6 +510,8 @@ class ChessRequestHandler(BaseHTTPRequestHandler):
     def send_json(self, payload, status=HTTPStatus.OK):
         body = json.dumps(payload).encode("utf-8")
         self.send_response(status)
+        self.send_security_headers()
+        self.send_no_store_headers()
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.maybe_set_session_cookie()
@@ -401,10 +519,15 @@ class ChessRequestHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def maybe_set_session_cookie(self):
+        if getattr(self, "clear_session_cookie", False):
+            self.send_header(
+                "Set-Cookie",
+                f"{SESSION_COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0",
+            )
         if getattr(self, "pending_session_token", None):
             self.send_header(
                 "Set-Cookie",
-                f"chess_session={self.pending_session_token}; Path=/; HttpOnly; SameSite=Lax",
+                f"{SESSION_COOKIE_NAME}={self.pending_session_token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={SESSION_MAX_AGE}",
             )
 
     def log_message(self, format_str, *args):

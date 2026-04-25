@@ -35,6 +35,15 @@ let currentView = "auth";
 let aiLoopRunning = false;
 let flash = null;
 
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
 async function api(path, options = {}) {
   const response = await fetch(path, {
     method: options.method || "GET",
@@ -73,7 +82,7 @@ function syncViewFromState() {
 
 function renderFlash() {
   if (!flash) return "";
-  return `<section class="flash-card ${flash.type === "error" ? "flash-error" : ""}">${flash.message}</section>`;
+  return `<section class="flash-card ${flash.type === "error" ? "flash-error" : ""}">${escapeHtml(flash.message)}</section>`;
 }
 
 function renderTopNav() {
@@ -82,7 +91,7 @@ function renderTopNav() {
     <header class="top-nav">
       <div>
         <h1>Chess Studio</h1>
-        <p>Signed in as <strong>${state.user.username}</strong></p>
+        <p>Signed in as <strong>${escapeHtml(state.user.username)}</strong></p>
       </div>
       <div class="top-nav-actions">
         <button class="secondary-button" data-nav="menu">Menu</button>
@@ -120,11 +129,11 @@ function renderAuthPage() {
           <form id="register-form" class="auth-form">
             <label>
               Username
-              <input name="username" type="text" required minlength="3" />
+              <input name="username" type="text" required minlength="3" maxlength="24" pattern="[A-Za-z0-9_-]{3,24}" />
             </label>
             <label>
               Password
-              <input name="password" type="password" required minlength="6" />
+              <input name="password" type="password" required minlength="8" maxlength="128" />
             </label>
             <button class="primary-button" type="submit">Register</button>
           </form>
@@ -134,11 +143,11 @@ function renderAuthPage() {
           <form id="login-form" class="auth-form">
             <label>
               Username
-              <input name="username" type="text" required />
+              <input name="username" type="text" required maxlength="24" pattern="[A-Za-z0-9_-]{3,24}" />
             </label>
             <label>
               Password
-              <input name="password" type="password" required />
+              <input name="password" type="password" required minlength="8" maxlength="128" />
             </label>
             <button class="primary-button" type="submit">Log In</button>
           </form>
@@ -201,7 +210,7 @@ function renderMenuPage() {
       ${renderTopNav()}
       ${renderFlash()}
       <section class="hero">
-        <h1>Welcome back, ${state.user.username}</h1>
+        <h1>Welcome back, ${escapeHtml(state.user.username)}</h1>
         <p>Pick a mode to start a match, then visit your profile page to review stored stats or update your account details.</p>
       </section>
       <section class="card quick-stats">
@@ -321,9 +330,9 @@ function renderGamePage() {
           <div class="info-bar">
             <div class="info-line">
               <span class="label-strong">Selected:</span>
-              <span>${state.selectionDisplay}</span>
+              <span>${escapeHtml(state.selectionDisplay)}</span>
               <span class="label-strong">Legal moves:</span>
-              <span>${state.selection.legalMovesText}</span>
+              <span>${escapeHtml(state.selection.legalMovesText)}</span>
             </div>
           </div>
         </section>
@@ -331,28 +340,28 @@ function renderGamePage() {
         <aside class="sidebar">
           <section class="card">
             <h2>Overview</h2>
-            <div class="info-row"><span class="muted">Mode</span><span>${state.modeLabel}</span></div>
-            <div class="info-row"><span class="muted">Turn</span><span>${state.turn}</span></div>
-            <div class="info-row"><span class="muted">Status</span><span class="status-pill">${state.status}</span></div>
-            <div class="info-row"><span class="muted">Last move</span><span>${state.lastMove}</span></div>
+            <div class="info-row"><span class="muted">Mode</span><span>${escapeHtml(state.modeLabel)}</span></div>
+            <div class="info-row"><span class="muted">Turn</span><span>${escapeHtml(state.turn)}</span></div>
+            <div class="info-row"><span class="muted">Status</span><span class="status-pill">${escapeHtml(state.status)}</span></div>
+            <div class="info-row"><span class="muted">Last move</span><span>${escapeHtml(state.lastMove)}</span></div>
             <div class="info-row"><span class="muted">Move count</span><span>${state.moveCount}</span></div>
           </section>
 
           <section class="card">
             <h2>Selected Piece</h2>
-            <div class="info-row"><span class="muted">Square</span><span>${state.selectionDisplay}</span></div>
-            <div class="info-row"><span class="muted">Legal moves</span><span>${state.selection.legalMovesText}</span></div>
+            <div class="info-row"><span class="muted">Square</span><span>${escapeHtml(state.selectionDisplay)}</span></div>
+            <div class="info-row"><span class="muted">Legal moves</span><span>${escapeHtml(state.selection.legalMovesText)}</span></div>
           </section>
 
           <section class="card">
             <h2>Account</h2>
-            <div class="info-row"><span class="muted">Player</span><span>${state.user.username}</span></div>
+            <div class="info-row"><span class="muted">Player</span><span>${escapeHtml(state.user.username)}</span></div>
             <div class="info-row"><span class="muted">Profile</span><span>View stats and update username/password from the profile page.</span></div>
           </section>
 
           <section class="card">
             <h2>Move Log</h2>
-            <div class="move-log">${moveLogText}</div>
+            <div class="move-log">${escapeHtml(moveLogText)}</div>
           </section>
         </aside>
       </section>
@@ -402,8 +411,8 @@ function renderProfilePage() {
       <section class="profile-layout">
         <section class="card">
           <h2>Account Details</h2>
-          <div class="info-row"><span class="muted">Username</span><span>${state.user.username}</span></div>
-          <div class="info-row"><span class="muted">Created</span><span>${state.user.created_at || "Unknown"}</span></div>
+          <div class="info-row"><span class="muted">Username</span><span>${escapeHtml(state.user.username)}</span></div>
+          <div class="info-row"><span class="muted">Created</span><span>${escapeHtml(state.user.created_at || "Unknown")}</span></div>
         </section>
 
         <section class="card">
@@ -427,7 +436,7 @@ function renderProfilePage() {
           <form id="username-form" class="auth-form">
             <label>
               New username
-              <input name="username" type="text" required minlength="3" value="${state.user.username}" />
+              <input name="username" type="text" required minlength="3" maxlength="24" pattern="[A-Za-z0-9_-]{3,24}" value="${escapeHtml(state.user.username)}" />
             </label>
             <button class="primary-button" type="submit">Update Username</button>
           </form>
@@ -438,11 +447,11 @@ function renderProfilePage() {
           <form id="password-form" class="auth-form">
             <label>
               Current password
-              <input name="currentPassword" type="password" required minlength="6" />
+              <input name="currentPassword" type="password" required minlength="8" maxlength="128" />
             </label>
             <label>
               New password
-              <input name="newPassword" type="password" required minlength="6" />
+              <input name="newPassword" type="password" required minlength="8" maxlength="128" />
             </label>
             <button class="primary-button" type="submit">Update Password</button>
           </form>
@@ -558,5 +567,5 @@ async function bootstrap() {
 
 bootstrap().catch((error) => {
   console.error(error);
-  app.innerHTML = `<main class="page"><section class="card"><h2>Web UI failed to load</h2><p>${error.message}</p></section></main>`;
+  app.innerHTML = `<main class="page"><section class="card"><h2>Web UI failed to load</h2><p>${escapeHtml(error.message)}</p></section></main>`;
 });
