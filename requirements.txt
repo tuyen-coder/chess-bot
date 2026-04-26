@@ -1,0 +1,5 @@
+numpy
+PyMySQL
+cryptography
+python-chess
+torch

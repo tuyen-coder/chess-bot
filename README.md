@@ -26,12 +26,11 @@ This project is a chess game built with `tkinter`, `python-chess`, and two AI ap
 - `app/engine/minimax.py`: random agent and minimax agent
 - `app/ml/model.py`: neural network, MCTS, self-play training, checkpointing
 - `app/web/app.py`: web server and API
-- `app/web/db.py`: SQLite user database
+- `app/web/db.py`: MySQL user database
 - `app/web/templates/index.html`: main web page
 - `app/static/css/styles.css`: browser styling
 - `app/static/js/app.js`: browser interactions
 - `app/ui/desktop_ui.py`: Tkinter desktop UI
-- `app/data/chess_web.db`: SQLite database file
 - `app/data/models/ml_model.pt`: saved ML checkpoint
 
 ## Requirements
@@ -39,10 +38,26 @@ This project is a chess game built with `tkinter`, `python-chess`, and two AI ap
 Install Python 3 and these packages:
 
 ```bash
-pip install python-chess torch numpy
+pip install -r requirements.txt
 ```
 
 `tkinter` is included with most Python desktop installs. On some systems you may need to install it separately.
+
+## Database Setup
+
+The web app uses MySQL for accounts, bot stats, Elo, and leaderboard data.
+
+Create a MySQL user or use an existing local user, then configure the connection with environment variables:
+
+```bash
+export MYSQL_HOST=127.0.0.1
+export MYSQL_PORT=3306
+export MYSQL_USER=root
+export MYSQL_PASSWORD=your_password
+export MYSQL_DATABASE=chess_web
+```
+
+The app creates the configured database and tables if they do not exist.
 
 ## How To Run
 

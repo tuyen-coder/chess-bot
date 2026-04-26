@@ -25,6 +25,8 @@ DEFAULT_CHECKPOINT = os.path.join(
     "models",
     "ml_model.pt",
 )
+REPLAY_BUFFER_MAX_SIZE = 5000
+REPLAY_SAMPLE_MULTIPLIER = 4
 
 PIECE_VALUES = {
     chess.PAWN: 1.0,
@@ -119,10 +121,12 @@ class ValueNet(nn.Module):
         )
 
         self.value_head = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(128 * 8 * 8, 256),
+            nn.Conv2d(128, 2, 1),
             nn.ReLU(),
-            nn.Linear(256, 1),
+            nn.Flatten(),
+            nn.Linear(2 * 8 * 8, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1),
             nn.Tanh(),
         )
 
@@ -155,16 +159,25 @@ def index_to_move(index):
     return chess.Move(from_square, to_square, promotion=PROMOTION_TYPES[promotion_index])
 
 
-def load_model(checkpoint_path=DEFAULT_CHECKPOINT):
+def replay_buffer_path_for(checkpoint_path):
+    base_path, _ = os.path.splitext(checkpoint_path)
+    return f"{base_path}_replay.npz"
+
+
+def load_model(checkpoint_path=DEFAULT_CHECKPOINT, model=None, optimizer=None):
     if not os.path.exists(checkpoint_path):
         return None
 
-    model = create_model()
+    model = model or create_model()
 
     try:
         checkpoint = torch.load(checkpoint_path, map_location=device)
         state_dict = checkpoint.get("model_state_dict", checkpoint)
         model.load_state_dict(state_dict)
+        if optimizer is not None and isinstance(checkpoint, dict):
+            optimizer_state = checkpoint.get("optimizer_state_dict")
+            if optimizer_state is not None:
+                optimizer.load_state_dict(optimizer_state)
         model.eval()
         print(f"Loaded ML checkpoint: {checkpoint_path}", flush=True)
         return model
@@ -173,8 +186,10 @@ def load_model(checkpoint_path=DEFAULT_CHECKPOINT):
         return None
 
 
-def save_model(model, checkpoint_path=DEFAULT_CHECKPOINT, metadata=None):
+def save_model(model, checkpoint_path=DEFAULT_CHECKPOINT, optimizer=None, metadata=None):
     payload = {"model_state_dict": model.state_dict()}
+    if optimizer is not None:
+        payload["optimizer_state_dict"] = optimizer.state_dict()
     if metadata:
         payload.update(metadata)
     torch.save(payload, checkpoint_path)
@@ -299,7 +314,7 @@ def expand_node(node, policy_logits=None, add_noise=False):
     for move, prior in zip(legal_moves, priors):
         node.board.push(move)
         node.children[move] = Node(
-            node.board.copy(),
+            node.board.copy(stack=False),
             node,
             prior=float(prior),
         )
@@ -372,6 +387,26 @@ def root_policy_target(root):
     return target
 
 
+def compact_policy_target(root):
+    total_visits = sum(child.visit_count for child in root.children.values())
+    legal_moves = list(root.children.keys())
+
+    if not legal_moves:
+        return np.array([], dtype=np.int64), np.array([], dtype=np.float32)
+
+    indices = np.array([move_to_index(move) for move in legal_moves], dtype=np.int64)
+
+    if total_visits <= 0:
+        probabilities = np.full(len(legal_moves), 1.0 / len(legal_moves), dtype=np.float32)
+    else:
+        probabilities = np.array(
+            [root.children[move].visit_count / total_visits for move in legal_moves],
+            dtype=np.float32,
+        )
+
+    return indices, probabilities
+
+
 # 6. MCTS with policy priors
 
 
@@ -380,7 +415,7 @@ def mcts_move(board, model, simulations=60, training=True):
         return None, terminal_value(board), np.zeros(ACTION_SIZE, dtype=np.float32)
 
     model.eval()
-    root = Node(board.copy())
+    root = Node(board.copy(stack=False))
     _, root_policy_logits = evaluate_board(root.board, model)
     expand_node(root, policy_logits=root_policy_logits, add_noise=training)
     run_simulations([root], model, simulations)
@@ -397,7 +432,7 @@ def white_game_result(board):
 
 
 def initialize_root(board):
-    root = Node(board.copy())
+    root = Node(board.copy(stack=False))
     return root
 
 
@@ -461,7 +496,7 @@ def generate_self_play_data(model, games, simulations, batch_size):
                 (
                     encode_board_array(game_state["board"]),
                     game_state["board"].turn,
-                    root_policy_target(root),
+                    compact_policy_target(root),
                 )
             )
             move = pick_root_move(root, training=True)
@@ -483,24 +518,150 @@ def generate_self_play_data(model, games, simulations, batch_size):
     return all_samples
 
 
+class ReplayBuffer:
+    def __init__(self, max_size=REPLAY_BUFFER_MAX_SIZE):
+        self.max_size = max_size
+        self.samples = []
+
+    def __len__(self):
+        return len(self.samples)
+
+    def add_samples(self, samples):
+        if not samples:
+            return
+        self.samples.extend(samples)
+        if len(self.samples) > self.max_size:
+            self.samples = self.samples[-self.max_size:]
+
+    def sample(self, count=None):
+        if count is None or count >= len(self.samples):
+            return list(self.samples)
+        indices = np.random.choice(len(self.samples), size=count, replace=False)
+        return [self.samples[index] for index in indices]
+
+    def save(self, path):
+        directory = os.path.dirname(path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        if not self.samples:
+            np.savez_compressed(
+                path,
+                states=np.empty((0, INPUT_PLANES, 8, 8), dtype=np.float32),
+                values=np.empty((0,), dtype=np.float32),
+                policy_indices=np.empty((0, 1), dtype=np.int64),
+                policy_probs=np.empty((0, 1), dtype=np.float32),
+                policy_lengths=np.empty((0,), dtype=np.int64),
+            )
+            return
+
+        states = np.stack([state for state, _, _ in self.samples]).astype(np.float32)
+        values = np.array([target for _, target, _ in self.samples], dtype=np.float32)
+        policy_targets = [policy for _, _, policy in self.samples]
+        max_moves = max(len(indices) for indices, _ in policy_targets)
+        max_moves = max(1, max_moves)
+        policy_indices = np.zeros((len(policy_targets), max_moves), dtype=np.int64)
+        policy_probs = np.zeros((len(policy_targets), max_moves), dtype=np.float32)
+        policy_lengths = np.zeros(len(policy_targets), dtype=np.int64)
+
+        for row, (indices, probabilities) in enumerate(policy_targets):
+            move_count = len(indices)
+            policy_lengths[row] = move_count
+            if move_count == 0:
+                continue
+            policy_indices[row, :move_count] = indices
+            policy_probs[row, :move_count] = probabilities
+
+        np.savez_compressed(
+            path,
+            states=states,
+            values=values,
+            policy_indices=policy_indices,
+            policy_probs=policy_probs,
+            policy_lengths=policy_lengths,
+        )
+
+    @classmethod
+    def load(cls, path, max_size=REPLAY_BUFFER_MAX_SIZE):
+        buffer = cls(max_size=max_size)
+        if not os.path.exists(path):
+            return buffer
+
+        try:
+            data = np.load(path)
+            states = data["states"]
+            values = data["values"]
+            policy_indices = data["policy_indices"]
+            policy_probs = data["policy_probs"]
+            policy_lengths = data["policy_lengths"]
+        except Exception as exc:
+            print(f"Replay buffer load failed ({path}): {exc}", flush=True)
+            return buffer
+
+        for row in range(len(states)):
+            move_count = int(policy_lengths[row])
+            indices = policy_indices[row, :move_count].astype(np.int64)
+            probabilities = policy_probs[row, :move_count].astype(np.float32)
+            buffer.samples.append((states[row].astype(np.float32), float(values[row]), (indices, probabilities)))
+
+        if len(buffer.samples) > buffer.max_size:
+            buffer.samples = buffer.samples[-buffer.max_size:]
+        print(f"Loaded replay buffer: {len(buffer)} samples", flush=True)
+        return buffer
+
+
+def pad_policy_targets(policy_targets):
+    max_moves = max(len(indices) for indices, _ in policy_targets)
+    max_moves = max(1, max_moves)
+    padded_indices = np.zeros((len(policy_targets), max_moves), dtype=np.int64)
+    padded_probs = np.zeros((len(policy_targets), max_moves), dtype=np.float32)
+
+    for row, (indices, probabilities) in enumerate(policy_targets):
+        move_count = len(indices)
+        if move_count == 0:
+            continue
+        padded_indices[row, :move_count] = indices
+        padded_probs[row, :move_count] = probabilities
+
+    return padded_indices, padded_probs
+
+
+def sparse_policy_loss(policy_logits, target_indices, target_probs):
+    log_normalizer = torch.logsumexp(policy_logits, dim=1)
+    selected_logits = policy_logits.gather(1, target_indices)
+    selected_score = (selected_logits * target_probs).sum(dim=1)
+    return (log_normalizer - selected_score).mean()
+
+
 # 8. Train / load model
 
 
 def train_model(
-    games=24,
-    simulations=80,
-    epochs=4,
+    games=96,
+    simulations=200,
+    epochs=5,
     checkpoint_path=DEFAULT_CHECKPOINT,
     force_retrain=False,
     self_play_batch_size=None,
+    replay_buffer_path=None,
+    replay_buffer_size=REPLAY_BUFFER_MAX_SIZE,
+    replay_sample_multiplier=REPLAY_SAMPLE_MULTIPLIER,
+    resume_training=False,
 ):
-    existing_model = None if force_retrain else load_model(checkpoint_path)
-    if existing_model is not None:
-        return existing_model
+    if not force_retrain and not resume_training:
+        existing_model = load_model(checkpoint_path)
+        if existing_model is not None:
+            return existing_model
 
     model = create_model()
-    optimizer = optim.Adam(model.parameters(), lr=0.0005)
+    optimizer = optim.AdamW(model.parameters(), lr=0.0005, weight_decay=1e-4)
     value_loss_fn = nn.MSELoss()
+    value_loss_weight = 0.5
+
+    if resume_training and not force_retrain:
+        load_model(checkpoint_path, model=model, optimizer=optimizer)
+
+    if replay_buffer_path is None:
+        replay_buffer_path = replay_buffer_path_for(checkpoint_path)
 
     if self_play_batch_size is None:
         self_play_batch_size = default_self_play_batch_size()
@@ -518,6 +679,23 @@ def train_model(
         batch_size=self_play_batch_size,
     )
 
+    fresh_sample_count = len(samples)
+    replay_buffer = ReplayBuffer.load(replay_buffer_path, max_size=replay_buffer_size)
+    replay_buffer.add_samples(samples)
+    replay_buffer.save(replay_buffer_path)
+
+    if fresh_sample_count == 0 and len(replay_buffer) > 0:
+        samples = replay_buffer.sample()
+        print(f"Training with {len(samples)} replay samples", flush=True)
+    elif len(replay_buffer) > fresh_sample_count:
+        replay_count = max(fresh_sample_count, fresh_sample_count * replay_sample_multiplier)
+        samples = replay_buffer.sample(min(len(replay_buffer), replay_count))
+        print(
+            f"Training with {len(samples)} replay samples "
+            f"({fresh_sample_count} fresh, {len(replay_buffer)} stored)",
+            flush=True,
+        )
+
     X = [state for state, _, _ in samples]
     y_value = [target for _, target, _ in samples]
     y_policy = [policy for _, _, policy in samples]
@@ -529,29 +707,36 @@ def train_model(
 
     X = torch.tensor(np.array(X), dtype=torch.float32)
     y_value = torch.tensor(np.array(y_value), dtype=torch.float32).unsqueeze(1)
-    y_policy = torch.tensor(np.array(y_policy), dtype=torch.float32)
+    y_policy_indices, y_policy_probs = pad_policy_targets(y_policy)
+    y_policy_indices = torch.tensor(y_policy_indices, dtype=torch.long)
+    y_policy_probs = torch.tensor(y_policy_probs, dtype=torch.float32)
 
     shuffled = torch.randperm(X.size(0))
     X = X[shuffled]
     y_value = y_value[shuffled]
-    y_policy = y_policy[shuffled]
+    y_policy_indices = y_policy_indices[shuffled]
+    y_policy_probs = y_policy_probs[shuffled]
 
     val_size = max(1, X.size(0) // 10) if X.size(0) >= 10 else 0
 
     if val_size > 0:
         X_val = X[:val_size]
         y_value_val = y_value[:val_size]
-        y_policy_val = y_policy[:val_size]
+        y_policy_indices_val = y_policy_indices[:val_size]
+        y_policy_probs_val = y_policy_probs[:val_size]
         X_train = X[val_size:]
         y_value_train = y_value[val_size:]
-        y_policy_train = y_policy[val_size:]
+        y_policy_indices_train = y_policy_indices[val_size:]
+        y_policy_probs_train = y_policy_probs[val_size:]
     else:
         X_val = None
         y_value_val = None
-        y_policy_val = None
+        y_policy_indices_val = None
+        y_policy_probs_val = None
         X_train = X
         y_value_train = y_value
-        y_policy_train = y_policy
+        y_policy_indices_train = y_policy_indices
+        y_policy_probs_train = y_policy_probs
 
     print(
         f"Training network on {X_train.size(0)} samples"
@@ -570,16 +755,21 @@ def train_model(
             indices = permutation[index:index + batch_size]
             batch_x = X_train[indices].to(device)
             batch_y_value = y_value_train[indices].to(device)
-            batch_y_policy = y_policy_train[indices].to(device)
+            batch_y_policy_indices = y_policy_indices_train[indices].to(device)
+            batch_y_policy_probs = y_policy_probs_train[indices].to(device)
 
             value_preds, policy_logits = model(batch_x)
             value_loss = value_loss_fn(value_preds, batch_y_value)
-            policy_log_probs = torch.log_softmax(policy_logits, dim=1)
-            policy_loss = -(batch_y_policy * policy_log_probs).sum(dim=1).mean()
-            loss = value_loss + policy_loss
+            policy_loss = sparse_policy_loss(
+                policy_logits,
+                batch_y_policy_indices,
+                batch_y_policy_probs,
+            )
+            loss = value_loss_weight * value_loss + policy_loss
 
             optimizer.zero_grad()
             loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
             total_loss += loss.item()
@@ -591,11 +781,12 @@ def train_model(
             with torch.inference_mode():
                 val_value_preds, val_policy_logits = model(X_val.to(device))
                 val_value_loss = value_loss_fn(val_value_preds, y_value_val.to(device)).item()
-                val_policy_log_probs = torch.log_softmax(val_policy_logits, dim=1)
-                val_policy_loss = -(
-                    y_policy_val.to(device) * val_policy_log_probs
-                ).sum(dim=1).mean().item()
-                val_loss = val_value_loss + val_policy_loss
+                val_policy_loss = sparse_policy_loss(
+                    val_policy_logits,
+                    y_policy_indices_val.to(device),
+                    y_policy_probs_val.to(device),
+                ).item()
+                val_loss = value_loss_weight * val_value_loss + val_policy_loss
             message += (
                 f" | val_loss: {val_loss:.4f}"
                 f" (value={val_value_loss:.4f}, policy={val_policy_loss:.4f})"
@@ -606,12 +797,14 @@ def train_model(
     save_model(
         model,
         checkpoint_path=checkpoint_path,
+        optimizer=optimizer,
         metadata={
             "games": games,
             "simulations": simulations,
             "epochs": epochs,
             "input_planes": INPUT_PLANES,
             "action_size": ACTION_SIZE,
+            "replay_buffer_size": len(replay_buffer),
         },
     )
 

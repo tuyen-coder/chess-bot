@@ -2,56 +2,117 @@ import hashlib
 import hmac
 import os
 import re
-import sqlite3
 import threading
-from pathlib import Path
 
-DB_PATH = Path(__file__).resolve().parents[1] / "data" / "chess_web.db"
+try:
+    import pymysql
+    from pymysql.cursors import DictCursor
+except ImportError as exc:
+    pymysql = None
+    DictCursor = None
+    PYMysql_IMPORT_ERROR = exc
+else:
+    PYMysql_IMPORT_ERROR = None
+
 DB_LOCK = threading.Lock()
 OPPONENTS = ["random", "minimax", "ml"]
 USERNAME_RE = re.compile(r"^[A-Za-z0-9_-]{3,24}$")
+MYSQL_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9_]+$")
 MAX_PASSWORD_LENGTH = 128
 STARTING_ELO = 1200
+MYSQL_CONFIG = {
+    "host": os.getenv("MYSQL_HOST", "127.0.0.1"),
+    "port": int(os.getenv("MYSQL_PORT", "3306")),
+    "user": os.getenv("MYSQL_USER", "root"),
+    "password": os.getenv("MYSQL_PASSWORD", ""),
+    "database": os.getenv("MYSQL_DATABASE", "chess_web"),
+}
+
+
+def mysql_database_name():
+    database = MYSQL_CONFIG["database"]
+    if not MYSQL_IDENTIFIER_RE.fullmatch(database):
+        raise ValueError("MYSQL_DATABASE must contain only letters, numbers, and underscores.")
+    return database
+
+
+def require_mysql_driver():
+    if pymysql is None:
+        raise RuntimeError(
+            "PyMySQL is required for MySQL support. Install it with: "
+            "pip install PyMySQL"
+        ) from PYMysql_IMPORT_ERROR
+
+
+def get_server_connection():
+    require_mysql_driver()
+    return pymysql.connect(
+        host=MYSQL_CONFIG["host"],
+        port=MYSQL_CONFIG["port"],
+        user=MYSQL_CONFIG["user"],
+        password=MYSQL_CONFIG["password"],
+        charset="utf8mb4",
+        autocommit=True,
+        cursorclass=DictCursor,
+    )
 
 
 def get_connection():
-    connection = sqlite3.connect(DB_PATH)
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA foreign_keys = ON")
-    return connection
+    require_mysql_driver()
+    return pymysql.connect(
+        host=MYSQL_CONFIG["host"],
+        port=MYSQL_CONFIG["port"],
+        user=MYSQL_CONFIG["user"],
+        password=MYSQL_CONFIG["password"],
+        database=MYSQL_CONFIG["database"],
+        charset="utf8mb4",
+        autocommit=False,
+        cursorclass=DictCursor,
+    )
 
 
 def init_db():
     with DB_LOCK:
+        database = mysql_database_name()
+        server_connection = get_server_connection()
+        server_cursor = server_connection.cursor()
+        server_cursor.execute(
+            f"CREATE DATABASE IF NOT EXISTS `{database}` "
+            "CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
+        )
+        server_connection.close()
+
         connection = get_connection()
         cursor = connection.cursor()
         cursor.execute(
             f"""
             CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                username TEXT NOT NULL UNIQUE,
-                password_hash TEXT NOT NULL,
-                password_salt TEXT NOT NULL,
-                elo INTEGER NOT NULL DEFAULT {STARTING_ELO},
-                multiplayer_wins INTEGER NOT NULL DEFAULT 0,
-                multiplayer_losses INTEGER NOT NULL DEFAULT 0,
-                multiplayer_draws INTEGER NOT NULL DEFAULT 0,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
-            )
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                username VARCHAR(24) NOT NULL UNIQUE,
+                password_hash CHAR(64) NOT NULL,
+                password_salt CHAR(32) NOT NULL,
+                elo INT NOT NULL DEFAULT {STARTING_ELO},
+                multiplayer_wins INT NOT NULL DEFAULT 0,
+                multiplayer_losses INT NOT NULL DEFAULT 0,
+                multiplayer_draws INT NOT NULL DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """
         )
         ensure_user_columns(cursor)
         cursor.execute(
             """
             CREATE TABLE IF NOT EXISTS user_stats (
-                user_id INTEGER NOT NULL,
-                opponent TEXT NOT NULL,
-                wins INTEGER NOT NULL DEFAULT 0,
-                losses INTEGER NOT NULL DEFAULT 0,
-                draws INTEGER NOT NULL DEFAULT 0,
+                user_id INT NOT NULL,
+                opponent VARCHAR(16) NOT NULL,
+                wins INT NOT NULL DEFAULT 0,
+                losses INT NOT NULL DEFAULT 0,
+                draws INT NOT NULL DEFAULT 0,
                 PRIMARY KEY (user_id, opponent),
-                FOREIGN KEY (user_id) REFERENCES users(id)
-            )
+                CONSTRAINT fk_user_stats_user
+                    FOREIGN KEY (user_id) REFERENCES users(id)
+                    ON DELETE CASCADE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """
         )
         connection.commit()
@@ -59,17 +120,17 @@ def init_db():
 
 
 def ensure_user_columns(cursor):
-    cursor.execute("PRAGMA table_info(users)")
-    columns = {row["name"] for row in cursor.fetchall()}
+    cursor.execute("SHOW COLUMNS FROM users")
+    columns = {row["Field"] for row in cursor.fetchall()}
     missing_columns = {
-        "elo": f"INTEGER NOT NULL DEFAULT {STARTING_ELO}",
-        "multiplayer_wins": "INTEGER NOT NULL DEFAULT 0",
-        "multiplayer_losses": "INTEGER NOT NULL DEFAULT 0",
-        "multiplayer_draws": "INTEGER NOT NULL DEFAULT 0",
+        "elo": f"INT NOT NULL DEFAULT {STARTING_ELO}",
+        "multiplayer_wins": "INT NOT NULL DEFAULT 0",
+        "multiplayer_losses": "INT NOT NULL DEFAULT 0",
+        "multiplayer_draws": "INT NOT NULL DEFAULT 0",
     }
     for column, definition in missing_columns.items():
         if column not in columns:
-            cursor.execute(f"ALTER TABLE users ADD COLUMN {column} {definition}")
+            cursor.execute(f"ALTER TABLE users ADD COLUMN `{column}` {definition}")
 
 
 def hash_password(password, salt=None):
@@ -108,6 +169,14 @@ def verify_password(password, password_hash, password_salt):
     return hmac.compare_digest(candidate_hash, password_hash)
 
 
+def format_timestamp(value):
+    if value is None:
+        return None
+    if hasattr(value, "isoformat"):
+        return value.isoformat(sep=" ", timespec="seconds")
+    return str(value)
+
+
 def create_user(username, password):
     username = normalize_username(username)
     password = validate_password(password)
@@ -121,7 +190,7 @@ def create_user(username, password):
             cursor.execute(
                 """
                 INSERT INTO users (username, password_hash, password_salt)
-                VALUES (?, ?, ?)
+                VALUES (%s, %s, %s)
                 """,
                 (username, password_hash, password_salt),
             )
@@ -131,7 +200,7 @@ def create_user(username, password):
                 cursor.execute(
                     """
                     INSERT INTO user_stats (user_id, opponent, wins, losses, draws)
-                    VALUES (?, ?, 0, 0, 0)
+                    VALUES (%s, %s, 0, 0, 0)
                     """,
                     (user_id, opponent),
                 )
@@ -141,7 +210,7 @@ def create_user(username, password):
                 "id": user_id,
                 "username": username,
             }
-        except sqlite3.IntegrityError as exc:
+        except pymysql.err.IntegrityError as exc:
             raise ValueError("Username already exists.") from exc
         finally:
             connection.close()
@@ -158,7 +227,7 @@ def verify_user(username, password):
             """
             SELECT id, username, password_hash, password_salt
             FROM users
-            WHERE username = ?
+            WHERE username = %s
             """,
             (username,),
         )
@@ -191,7 +260,7 @@ def get_user_auth(user_id):
                 multiplayer_draws,
                 created_at
             FROM users
-            WHERE id = ?
+            WHERE id = %s
             """,
             (user_id,),
         )
@@ -214,7 +283,7 @@ def get_user(user_id):
         "multiplayer_wins": row["multiplayer_wins"],
         "multiplayer_losses": row["multiplayer_losses"],
         "multiplayer_draws": row["multiplayer_draws"],
-        "created_at": row["created_at"],
+        "created_at": format_timestamp(row["created_at"]),
     }
 
 
@@ -228,15 +297,15 @@ def update_username(user_id, new_username):
             cursor.execute(
                 """
                 UPDATE users
-                SET username = ?
-                WHERE id = ?
+                SET username = %s
+                WHERE id = %s
                 """,
                 (new_username, user_id),
             )
             if cursor.rowcount == 0:
                 raise ValueError("User not found.")
             connection.commit()
-        except sqlite3.IntegrityError as exc:
+        except pymysql.err.IntegrityError as exc:
             raise ValueError("Username already exists.") from exc
         finally:
             connection.close()
@@ -262,8 +331,8 @@ def update_password(user_id, current_password, new_password):
         cursor.execute(
             """
             UPDATE users
-            SET password_hash = ?, password_salt = ?
-            WHERE id = ?
+            SET password_hash = %s, password_salt = %s
+            WHERE id = %s
             """,
             (new_hash, new_salt, user_id),
         )
@@ -279,7 +348,7 @@ def get_user_stats(user_id):
             """
             SELECT opponent, wins, losses, draws
             FROM user_stats
-            WHERE user_id = ?
+            WHERE user_id = %s
             ORDER BY opponent
             """,
             (user_id,),
@@ -318,7 +387,7 @@ def get_leaderboard(limit=10):
             SELECT id, username, elo, multiplayer_wins, multiplayer_losses, multiplayer_draws
             FROM users
             ORDER BY elo DESC, multiplayer_wins DESC, username ASC
-            LIMIT ?
+            LIMIT %s
             """,
             (safe_limit,),
         )
@@ -358,7 +427,7 @@ def record_multiplayer_result(white_user_id, black_user_id, result):
         connection = get_connection()
         cursor = connection.cursor()
         cursor.execute(
-            "SELECT id, elo FROM users WHERE id IN (?, ?)",
+            "SELECT id, elo FROM users WHERE id IN (%s, %s)",
             (white_user_id, black_user_id),
         )
         rows = {row["id"]: row for row in cursor.fetchall()}
@@ -389,11 +458,11 @@ def record_multiplayer_result(white_user_id, black_user_id, result):
         black_new = round(black_elo + k_factor * (black_score - expected_score(black_elo, white_elo)))
 
         cursor.execute(
-            f"UPDATE users SET elo = ?, {white_column} = {white_column} + 1 WHERE id = ?",
+            f"UPDATE users SET elo = %s, {white_column} = {white_column} + 1 WHERE id = %s",
             (white_new, white_user_id),
         )
         cursor.execute(
-            f"UPDATE users SET elo = ?, {black_column} = {black_column} + 1 WHERE id = ?",
+            f"UPDATE users SET elo = %s, {black_column} = {black_column} + 1 WHERE id = %s",
             (black_new, black_user_id),
         )
         connection.commit()
@@ -420,7 +489,7 @@ def record_result(user_id, opponent, result):
                 """
                 UPDATE user_stats
                 SET wins = wins + 1
-                WHERE user_id = ? AND opponent = ?
+                WHERE user_id = %s AND opponent = %s
                 """,
                 (user_id, opponent),
             )
@@ -429,7 +498,7 @@ def record_result(user_id, opponent, result):
                 """
                 UPDATE user_stats
                 SET losses = losses + 1
-                WHERE user_id = ? AND opponent = ?
+                WHERE user_id = %s AND opponent = %s
                 """,
                 (user_id, opponent),
             )
@@ -438,7 +507,7 @@ def record_result(user_id, opponent, result):
                 """
                 UPDATE user_stats
                 SET draws = draws + 1
-                WHERE user_id = ? AND opponent = ?
+                WHERE user_id = %s AND opponent = %s
                 """,
                 (user_id, opponent),
             )

@@ -1,3 +1,6 @@
 .pycache/
 __pycache__/
 app/data/models/*.pt
+app/data/models/*.npz
+app/data/mysql_data/
+mysql-homebrew-3307.cnf
