@@ -36,6 +36,10 @@ let currentView = "auth";
 let aiLoopRunning = false;
 let onlineLoopRunning = false;
 let flash = null;
+let reviewPly = null;
+let historyList = [];
+let selectedHistoryGame = null;
+let historyReviewPly = 0;
 
 function escapeHtml(value) {
   return String(value ?? "")
@@ -78,7 +82,7 @@ function syncViewFromState() {
     currentView = "online";
     return;
   }
-  if (!["menu", "game", "profile"].includes(currentView)) {
+  if (!["menu", "game", "profile", "history", "historyReplay"].includes(currentView)) {
     currentView = state.inMenu ? "menu" : "game";
   }
   if (state.user && currentView === "auth") {
@@ -102,6 +106,7 @@ function renderTopNav() {
       <div class="top-nav-actions">
         <button class="secondary-button" data-nav="menu">Menu</button>
         <button class="secondary-button" data-nav="profile">Profile</button>
+        <button class="secondary-button" data-nav="history">History</button>
         <button class="secondary-button" id="logout-button">Log out</button>
       </div>
     </header>
@@ -306,7 +311,32 @@ function renderMenuPage() {
   });
 }
 
-function buildBoardGrid() {
+function boardViewData() {
+  if (reviewPly === null || !state?.historyBoards?.length) {
+    return {
+      board: state.board,
+      selected: state.selected,
+      legalMoves: state.legalMoves || [],
+      checkSquare: state.checkSquare,
+      canClick: state.canInteract,
+      label: "Live",
+    };
+  }
+
+  const maxPly = state.historyBoards.length - 1;
+  const ply = Math.max(0, Math.min(reviewPly, maxPly));
+  reviewPly = ply;
+  return {
+    board: state.historyBoards[ply],
+    selected: null,
+    legalMoves: [],
+    checkSquare: state.historyCheckSquares?.[ply] || null,
+    canClick: false,
+    label: `Move ${ply} / ${maxPly}`,
+  };
+}
+
+function buildBoardGrid(viewData = boardViewData()) {
   const topCoords = "abcdefgh".split("").map((file, index) =>
     `<div class="coord" style="grid-row:1;grid-column:${index + 2};">${file}</div>`
   ).join("");
@@ -321,11 +351,11 @@ function buildBoardGrid() {
     `
   ).join("");
 
-  const selectedKey = state.selected ? `${state.selected[0]}-${state.selected[1]}` : null;
-  const legalKeys = new Set((state.legalMoves || []).map(([row, col]) => `${row}-${col}`));
-  const checkKey = state.checkSquare ? `${state.checkSquare[0]}-${state.checkSquare[1]}` : null;
+  const selectedKey = viewData.selected ? `${viewData.selected[0]}-${viewData.selected[1]}` : null;
+  const legalKeys = new Set((viewData.legalMoves || []).map(([row, col]) => `${row}-${col}`));
+  const checkKey = viewData.checkSquare ? `${viewData.checkSquare[0]}-${viewData.checkSquare[1]}` : null;
 
-  const squares = state.board.flatMap((row, rowIndex) =>
+  const squares = viewData.board.flatMap((row, rowIndex) =>
     row.map((piece, colIndex) => {
       const key = `${rowIndex}-${colIndex}`;
       const classes = ["square", (rowIndex + colIndex) % 2 === 0 ? "light" : "dark"];
@@ -345,7 +375,7 @@ function buildBoardGrid() {
   ).join("");
 
   return `
-    <div class="board-wrap ${state.canInteract ? "" : "loading"}">
+    <div class="board-wrap">
       ${topCoords}
       ${bottomCoords}
       ${rankLabels}
@@ -354,7 +384,43 @@ function buildBoardGrid() {
   `;
 }
 
+function reviewControls() {
+  const maxPly = Math.max(0, (state.historyBoards?.length || 1) - 1);
+  const currentPly = reviewPly === null ? maxPly : reviewPly;
+  return `
+    <div class="review-controls">
+      <button class="secondary-button icon-button" id="review-first" type="button">|&lt;</button>
+      <button class="secondary-button icon-button" id="review-prev" type="button">&lt;</button>
+      <span class="review-label">${reviewPly === null ? "Live" : `Move ${currentPly} / ${maxPly}`}</span>
+      <button class="secondary-button icon-button" id="review-next" type="button">&gt;</button>
+      <button class="secondary-button" id="review-live" type="button">Live</button>
+    </div>
+  `;
+}
+
+function bindReviewControls() {
+  const maxPly = Math.max(0, (state.historyBoards?.length || 1) - 1);
+  document.getElementById("review-first")?.addEventListener("click", () => {
+    reviewPly = 0;
+    render();
+  });
+  document.getElementById("review-prev")?.addEventListener("click", () => {
+    reviewPly = Math.max(0, (reviewPly === null ? maxPly : reviewPly) - 1);
+    render();
+  });
+  document.getElementById("review-next")?.addEventListener("click", () => {
+    const next = Math.min(maxPly, (reviewPly === null ? maxPly : reviewPly) + 1);
+    reviewPly = next === maxPly ? null : next;
+    render();
+  });
+  document.getElementById("review-live")?.addEventListener("click", () => {
+    reviewPly = null;
+    render();
+  });
+}
+
 function renderGamePage() {
+  const viewData = boardViewData();
   const moveLogText = state.moveLog.length
     ? state.moveLog.reduce((lines, move, index, allMoves) => {
         if (index % 2 === 0) {
@@ -379,7 +445,8 @@ function renderGamePage() {
             </div>
             <button class="secondary-button" id="back-button">Back to Menu</button>
           </div>
-          ${buildBoardGrid()}
+          ${buildBoardGrid(viewData)}
+          ${reviewControls()}
           <div class="info-bar">
             <div class="info-line">
               <span class="label-strong">Selected:</span>
@@ -415,6 +482,29 @@ function renderGamePage() {
             <div class="info-row"><span class="muted">Profile</span><span>View stats and update username/password from the profile page.</span></div>
           </section>
 
+          ${state.online ? `
+            <section class="card">
+              <h2>Match Actions</h2>
+              ${state.drawOffer ? `
+                <div class="info-row"><span class="muted">Draw</span><span>${escapeHtml(state.drawOffer.fromUsername)} offered a draw</span></div>
+                ${state.drawOffer.canRespond ? `
+                  <div class="action-row">
+                    <button class="primary-button" id="accept-draw-button">Accept</button>
+                    <button class="secondary-button" id="decline-draw-button">Decline</button>
+                  </div>
+                ` : ""}
+              ` : ""}
+              <div class="action-row">
+                <button class="secondary-button" id="offer-draw-button" ${state.gameOver ? "disabled" : ""}>Offer Draw</button>
+                <button class="secondary-button danger-button" id="resign-button" ${state.gameOver ? "disabled" : ""}>Resign</button>
+              </div>
+              <div class="action-row">
+                <button class="primary-button" id="rematch-button" ${state.gameOver ? "" : "disabled"}>${state.rematchRequested ? "Rematch Requested" : "Rematch"}</button>
+              </div>
+              ${state.opponentRematchRequested ? `<p class="muted">Opponent requested a rematch.</p>` : ""}
+            </section>
+          ` : ""}
+
           <section class="card">
             <h2>Move Log</h2>
             <div class="move-log">${escapeHtml(moveLogText)}</div>
@@ -425,6 +515,7 @@ function renderGamePage() {
   `;
 
   bindAuthenticatedNav();
+  bindReviewControls();
 
   document.getElementById("back-button").addEventListener("click", async () => {
     state = await api(state.online ? "/api/matchmaking/leave" : "/api/menu", { method: "POST" });
@@ -436,6 +527,7 @@ function renderGamePage() {
   app.querySelectorAll(".square").forEach((square) => {
     square.addEventListener("click", async () => {
       if (!state.canInteract) return;
+      if (reviewPly !== null) return;
       try {
         state = await api(state.online ? "/api/matchmaking/click" : "/api/click", {
           method: "POST",
@@ -445,6 +537,7 @@ function renderGamePage() {
           },
         });
         clearFlash();
+        reviewPly = null;
         render();
         if (state.online) {
           runOnlineLoopIfNeeded();
@@ -456,6 +549,37 @@ function renderGamePage() {
       }
     });
   });
+
+  if (state.online) {
+    document.getElementById("offer-draw-button")?.addEventListener("click", async () => {
+      state = await api("/api/matchmaking/draw-offer", { method: "POST" });
+      render();
+    });
+    document.getElementById("resign-button")?.addEventListener("click", async () => {
+      state = await api("/api/matchmaking/resign", { method: "POST" });
+      setFlash(state.gameResult || "Game finished.", "success");
+    });
+    document.getElementById("accept-draw-button")?.addEventListener("click", async () => {
+      state = await api("/api/matchmaking/draw-respond", {
+        method: "POST",
+        body: { accept: true },
+      });
+      setFlash(state.gameResult || "Draw agreed.", "success");
+    });
+    document.getElementById("decline-draw-button")?.addEventListener("click", async () => {
+      state = await api("/api/matchmaking/draw-respond", {
+        method: "POST",
+        body: { accept: false },
+      });
+      render();
+    });
+    document.getElementById("rematch-button")?.addEventListener("click", async () => {
+      state = await api("/api/matchmaking/rematch", { method: "POST" });
+      reviewPly = null;
+      render();
+      runOnlineLoopIfNeeded();
+    });
+  }
 }
 
 function renderWaitingPage() {
@@ -593,12 +717,158 @@ function renderProfilePage() {
   });
 }
 
+function historyRows() {
+  if (!historyList.length) {
+    return `<tr><td colspan="6">No completed games yet.</td></tr>`;
+  }
+  return historyList.map((game) => `
+    <tr>
+      <td>${escapeHtml(game.createdAt || "")}</td>
+      <td>${escapeHtml(game.mode)}</td>
+      <td>${escapeHtml(game.whiteUsername)} vs ${escapeHtml(game.blackUsername)}</td>
+      <td>${escapeHtml(game.resultLabel)}</td>
+      <td>${escapeHtml(game.termination)}</td>
+      <td><button class="secondary-button replay-button" data-history-id="${game.id}">Replay</button></td>
+    </tr>
+  `).join("");
+}
+
+function historyBoardView() {
+  if (!selectedHistoryGame?.historyBoards?.length) return "";
+  const maxPly = selectedHistoryGame.historyBoards.length - 1;
+  const ply = Math.max(0, Math.min(historyReviewPly, maxPly));
+  historyReviewPly = ply;
+  return `
+    <section class="board-panel">
+      ${buildBoardGrid({
+        board: selectedHistoryGame.historyBoards[ply],
+        selected: null,
+        legalMoves: [],
+        checkSquare: selectedHistoryGame.historyCheckSquares?.[ply] || null,
+        canClick: false,
+      })}
+      <div class="review-controls">
+        <button class="secondary-button icon-button" id="history-first" type="button">|&lt;</button>
+        <button class="secondary-button icon-button" id="history-prev" type="button">&lt;</button>
+        <span class="review-label">Move ${ply} / ${maxPly}</span>
+        <button class="secondary-button icon-button" id="history-next" type="button">&gt;</button>
+        <button class="secondary-button" id="history-last" type="button">Last</button>
+      </div>
+      <div class="move-log">${escapeHtml((selectedHistoryGame.moves || []).join("\n"))}</div>
+    </section>
+  `;
+}
+
+function renderHistoryPage() {
+  app.innerHTML = `
+    <main class="page">
+      ${renderTopNav()}
+      ${renderFlash()}
+      <section class="hero">
+        <h1>Game History</h1>
+        <p>Review completed online and bot matches.</p>
+      </section>
+      <section class="card">
+        <h2>Recent Games</h2>
+        <table class="stats-table">
+          <thead>
+            <tr>
+              <th>Date</th>
+              <th>Mode</th>
+              <th>Players</th>
+              <th>Result</th>
+              <th>End</th>
+              <th>Replay</th>
+            </tr>
+          </thead>
+          <tbody>${historyRows()}</tbody>
+        </table>
+      </section>
+    </main>
+  `;
+
+  bindAuthenticatedNav();
+  app.querySelectorAll(".replay-button").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const response = await api("/api/history/detail", {
+        method: "POST",
+        body: { id: Number(button.dataset.historyId) },
+      });
+      selectedHistoryGame = response.game;
+      historyReviewPly = 0;
+      currentView = "historyReplay";
+      render();
+    });
+  });
+}
+
+function renderHistoryReplayPage() {
+  app.innerHTML = `
+    <main class="page replay-page">
+      ${renderTopNav()}
+      ${renderFlash()}
+      <section class="replay-shell">
+        <div class="board-header replay-header">
+          <div>
+            <h1>Replay</h1>
+            <p class="muted">${selectedHistoryGame ? `${escapeHtml(selectedHistoryGame.whiteUsername)} vs ${escapeHtml(selectedHistoryGame.blackUsername)}` : "Choose a completed game"}</p>
+          </div>
+          <button class="secondary-button" id="back-to-history-button">Back to History</button>
+        </div>
+        ${selectedHistoryGame ? `
+          <div class="replay-result-row">
+            <span class="status-pill">${escapeHtml(selectedHistoryGame.resultLabel)}</span>
+            <span class="muted">${escapeHtml(selectedHistoryGame.createdAt || "")}</span>
+          </div>
+          ${historyBoardView()}
+        ` : `<section class="card"><h2>Replay</h2><p class="muted">Choose a completed game from History.</p></section>`}
+      </section>
+    </main>
+  `;
+
+  bindAuthenticatedNav();
+  document.getElementById("back-to-history-button")?.addEventListener("click", () => {
+    currentView = "history";
+    renderHistoryPage();
+  });
+
+  const maxPly = Math.max(0, (selectedHistoryGame?.historyBoards?.length || 1) - 1);
+  document.getElementById("history-first")?.addEventListener("click", () => {
+    historyReviewPly = 0;
+    renderHistoryReplayPage();
+  });
+  document.getElementById("history-prev")?.addEventListener("click", () => {
+    historyReviewPly = Math.max(0, historyReviewPly - 1);
+    renderHistoryReplayPage();
+  });
+  document.getElementById("history-next")?.addEventListener("click", () => {
+    historyReviewPly = Math.min(maxPly, historyReviewPly + 1);
+    renderHistoryReplayPage();
+  });
+  document.getElementById("history-last")?.addEventListener("click", () => {
+    historyReviewPly = maxPly;
+    renderHistoryReplayPage();
+  });
+}
+
+async function loadHistoryPage() {
+  const response = await api("/api/history/list", { method: "POST" });
+  historyList = response.history || [];
+  currentView = "history";
+  clearFlash();
+  render();
+}
+
 function bindAuthenticatedNav() {
   app.querySelectorAll("[data-nav]").forEach((button) => {
     button.addEventListener("click", async () => {
       currentView = button.dataset.nav;
       if (currentView === "menu") {
         state = await api("/api/menu", { method: "POST" });
+      }
+      if (currentView === "history") {
+        await loadHistoryPage();
+        return;
       }
       clearFlash();
       render();
@@ -623,6 +893,14 @@ function render() {
   }
   if (currentView === "profile") {
     renderProfilePage();
+    return;
+  }
+  if (currentView === "history") {
+    renderHistoryPage();
+    return;
+  }
+  if (currentView === "historyReplay") {
+    renderHistoryReplayPage();
     return;
   }
   if (currentView === "online") {

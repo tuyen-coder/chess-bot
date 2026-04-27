@@ -186,6 +186,17 @@ body {
   padding: 9px 16px;
 }
 
+.primary-button:disabled,
+.secondary-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+.danger-button {
+  border-color: #8a2e20;
+  color: #8a2e20;
+}
+
 .game-layout {
   display: grid;
   grid-template-columns: minmax(680px, 1fr) 360px;
@@ -268,6 +279,34 @@ body {
   align-items: baseline;
 }
 
+.review-controls,
+.action-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+}
+
+.review-controls {
+  margin-top: 14px;
+}
+
+.icon-button {
+  width: 48px;
+  padding-left: 0;
+  padding-right: 0;
+}
+
+.review-label {
+  min-width: 96px;
+  font-weight: 700;
+  color: var(--accent);
+}
+
+.action-row {
+  margin-top: 10px;
+}
+
 .label-strong {
   font-family: Georgia, "Times New Roman", serif;
   font-weight: 700;
@@ -300,6 +339,34 @@ body {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
   gap: 20px;
+}
+
+.replay-page {
+  max-width: 980px;
+}
+
+.replay-shell {
+  display: grid;
+  justify-items: center;
+  gap: 16px;
+}
+
+.replay-shell .board-panel {
+  width: fit-content;
+  max-width: 100%;
+}
+
+.replay-header,
+.replay-result-row {
+  width: 100%;
+}
+
+.replay-result-row {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
 }
 
 .stats-table {

@@ -69,6 +69,32 @@ python3 run.py
 
 Then open `http://127.0.0.1:8000`.
 
+## How To Run With Docker
+
+If Docker Desktop is running, start the web app and MySQL together with:
+
+```bash
+docker compose up --build
+```
+
+Then open:
+
+```text
+http://127.0.0.1:8000
+```
+
+Stop the containers with `Ctrl+C`, or from another terminal:
+
+```bash
+docker compose down
+```
+
+To also delete the Docker MySQL database volume and start with a fresh database:
+
+```bash
+docker compose down -v
+```
+
 If you want the desktop UI, run:
 
 ```bash

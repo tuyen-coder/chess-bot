@@ -1,5 +1,6 @@
 import hashlib
 import hmac
+import json
 import os
 import re
 import threading
@@ -112,6 +113,37 @@ def init_db():
                 CONSTRAINT fk_user_stats_user
                     FOREIGN KEY (user_id) REFERENCES users(id)
                     ON DELETE CASCADE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS game_history (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                mode VARCHAR(32) NOT NULL,
+                white_user_id INT NULL,
+                black_user_id INT NULL,
+                white_username VARCHAR(24) NOT NULL,
+                black_username VARCHAR(24) NOT NULL,
+                result VARCHAR(16) NOT NULL,
+                result_label VARCHAR(120) NOT NULL,
+                termination VARCHAR(32) NOT NULL,
+                moves_json JSON NOT NULL,
+                white_elo_before INT NULL,
+                white_elo_after INT NULL,
+                white_elo_change INT NULL,
+                black_elo_before INT NULL,
+                black_elo_after INT NULL,
+                black_elo_change INT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                INDEX idx_game_history_white_user (white_user_id),
+                INDEX idx_game_history_black_user (black_user_id),
+                CONSTRAINT fk_game_history_white_user
+                    FOREIGN KEY (white_user_id) REFERENCES users(id)
+                    ON DELETE SET NULL,
+                CONSTRAINT fk_game_history_black_user
+                    FOREIGN KEY (black_user_id) REFERENCES users(id)
+                    ON DELETE SET NULL
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """
         )
@@ -472,6 +504,132 @@ def record_multiplayer_result(white_user_id, black_user_id, result):
         "white": {"old": white_elo, "new": white_new, "change": white_new - white_elo},
         "black": {"old": black_elo, "new": black_new, "change": black_new - black_elo},
     }
+
+
+def save_game_history(
+    mode,
+    white_user_id,
+    black_user_id,
+    white_username,
+    black_username,
+    result,
+    result_label,
+    termination,
+    moves,
+    elo_change=None,
+):
+    elo_change = elo_change or {}
+    white_elo = elo_change.get("white", {})
+    black_elo = elo_change.get("black", {})
+
+    with DB_LOCK:
+        connection = get_connection()
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            INSERT INTO game_history (
+                mode,
+                white_user_id,
+                black_user_id,
+                white_username,
+                black_username,
+                result,
+                result_label,
+                termination,
+                moves_json,
+                white_elo_before,
+                white_elo_after,
+                white_elo_change,
+                black_elo_before,
+                black_elo_after,
+                black_elo_change
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """,
+            (
+                mode,
+                white_user_id,
+                black_user_id,
+                white_username,
+                black_username,
+                result,
+                result_label,
+                termination,
+                json.dumps(moves),
+                white_elo.get("old"),
+                white_elo.get("new"),
+                white_elo.get("change"),
+                black_elo.get("old"),
+                black_elo.get("new"),
+                black_elo.get("change"),
+            ),
+        )
+        history_id = cursor.lastrowid
+        connection.commit()
+        connection.close()
+    return history_id
+
+
+def game_history_row_payload(row, include_moves=False):
+    payload = {
+        "id": row["id"],
+        "mode": row["mode"],
+        "whiteUserId": row["white_user_id"],
+        "blackUserId": row["black_user_id"],
+        "whiteUsername": row["white_username"],
+        "blackUsername": row["black_username"],
+        "result": row["result"],
+        "resultLabel": row["result_label"],
+        "termination": row["termination"],
+        "whiteEloBefore": row["white_elo_before"],
+        "whiteEloAfter": row["white_elo_after"],
+        "whiteEloChange": row["white_elo_change"],
+        "blackEloBefore": row["black_elo_before"],
+        "blackEloAfter": row["black_elo_after"],
+        "blackEloChange": row["black_elo_change"],
+        "createdAt": format_timestamp(row["created_at"]),
+    }
+    if include_moves:
+        moves = row["moves_json"]
+        payload["moves"] = json.loads(moves) if isinstance(moves, str) else moves
+    return payload
+
+
+def get_game_history(user_id, limit=20):
+    safe_limit = max(1, min(int(limit), 100))
+    with DB_LOCK:
+        connection = get_connection()
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            SELECT *
+            FROM game_history
+            WHERE white_user_id = %s OR black_user_id = %s
+            ORDER BY created_at DESC, id DESC
+            LIMIT %s
+            """,
+            (user_id, user_id, safe_limit),
+        )
+        rows = cursor.fetchall()
+        connection.close()
+    return [game_history_row_payload(row) for row in rows]
+
+
+def get_game_history_detail(user_id, history_id):
+    with DB_LOCK:
+        connection = get_connection()
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            SELECT *
+            FROM game_history
+            WHERE id = %s AND (white_user_id = %s OR black_user_id = %s)
+            """,
+            (history_id, user_id, user_id),
+        )
+        row = cursor.fetchone()
+        connection.close()
+    return game_history_row_payload(row, include_moves=True) if row else None
 
 
 def record_result(user_id, opponent, result):

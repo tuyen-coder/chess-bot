@@ -1,6 +1,9 @@
+.DS_Store
+.git
+.gitignore
 .pycache/
 __pycache__/
-.DS_Store
+app/**/__pycache__/
 app/data/models/*.pt
 app/data/models/*.npz
 app/data/mysql_data/

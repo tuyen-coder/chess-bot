@@ -1,5 +1,34 @@
 # Run MySQL And Chess App
 
+## Docker: Start Everything
+
+If Docker Desktop is running, this is the easiest way:
+
+```bash
+cd /Users/lannguyen/Downloads/AI-Assignment-2-main
+docker compose up --build
+```
+
+Open:
+
+```text
+http://127.0.0.1:8000
+```
+
+Stop with `Ctrl+C`, or run:
+
+```bash
+docker compose down
+```
+
+Reset the Docker database:
+
+```bash
+docker compose down -v
+```
+
+## Manual: Start Everything
+
 ## Terminal 1: Start MySQL
 
 ```bash
@@ -24,10 +53,13 @@ cd /Users/lannguyen/Downloads/AI-Assignment-2-main
 MYSQL_HOST=127.0.0.1 \
 MYSQL_PORT=3307 \
 MYSQL_USER=chess_app \
-MYSQL_PASSWORD='your_mysql_password' \
+MYSQL_PASSWORD='chesspass123' \
 MYSQL_DATABASE=chess_web \
 python3 run.py
 ```
+
+Use the same MySQL values as `docker-compose.yml`. The password is
+`chesspass123`, not the placeholder `your_mysql_password`.
 
 Open:
 
