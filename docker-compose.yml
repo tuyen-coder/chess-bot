@@ -2,16 +2,16 @@ services:
   db:
     image: mysql:8.0
     environment:
-      MYSQL_ROOT_PASSWORD: rootpass123
-      MYSQL_DATABASE: chess_web
-      MYSQL_USER: chess_app
-      MYSQL_PASSWORD: chesspass123
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_USER: ${MYSQL_USER}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+      MYSQL_DATABASE: ${MYSQL_DATABASE}
     ports:
       - "3307:3306"
     volumes:
       - mysql_data:/var/lib/mysql
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uchess_app", "-pchesspass123"]
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u$${MYSQL_USER} -p$${MYSQL_PASSWORD}"]
       interval: 5s
       timeout: 3s
       retries: 20
@@ -23,9 +23,9 @@ services:
       WEB_PORT: 8000
       MYSQL_HOST: db
       MYSQL_PORT: 3306
-      MYSQL_USER: chess_app
-      MYSQL_PASSWORD: chesspass123
-      MYSQL_DATABASE: chess_web
+      MYSQL_USER: ${MYSQL_USER}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+      MYSQL_DATABASE: ${MYSQL_DATABASE}
     ports:
       - "8000:8000"
     depends_on:

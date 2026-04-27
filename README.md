@@ -5,18 +5,35 @@ This project is a chess game built with `tkinter`, `python-chess`, and two AI ap
 - a classic minimax agent with alpha-beta pruning
 - a neural-network-based agent trained from self-play with MCTS
 
+![AI Chess web app preview](docs/media/web-preview.svg)
+
+## Demo
+
+![Gameplay replay demo](docs/media/gameplay-demo.gif)
+
+The web app includes account login, bot game modes, online matchmaking, Elo tracking, a leaderboard, and replay controls for reviewing previous board states.
+
 ## Features
 
 - Play chess in a desktop GUI
+- Play chess in a browser with account auth and profile management
 - Highlight legal moves and checks
+- Queue into online two-player matches
+- Track Elo, game history, and leaderboard results
+- Review move history with replay controls
 - Play in multiple modes:
   - Player vs Player
+  - Online Match
   - Player vs Random AI
   - Player vs Minimax AI
   - Random AI vs Minimax AI
   - Minimax AI vs Minimax AI
   - Player vs ML AI
   - ML AI vs Random AI
+
+## Visual Overview
+
+![System overview](docs/media/system-overview.svg)
 
 ## Project Structure
 
