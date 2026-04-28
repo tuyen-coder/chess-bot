@@ -5,6 +5,10 @@ import os
 import re
 import threading
 
+from app.web.env import load_env_file
+
+load_env_file()
+
 try:
     import pymysql
     from pymysql.cursors import DictCursor
@@ -72,83 +76,112 @@ def get_connection():
     )
 
 
-def init_db():
-    with DB_LOCK:
-        database = mysql_database_name()
-        server_connection = get_server_connection()
+def create_database(database):
+    server_connection = get_server_connection()
+    try:
         server_cursor = server_connection.cursor()
         server_cursor.execute(
             f"CREATE DATABASE IF NOT EXISTS `{database}` "
             "CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
         )
+    finally:
         server_connection.close()
 
-        connection = get_connection()
+
+def connection_error_message(exc):
+    return (
+        "Could not connect to MySQL with "
+        f"MYSQL_HOST={MYSQL_CONFIG['host']}, "
+        f"MYSQL_PORT={MYSQL_CONFIG['port']}, "
+        f"MYSQL_USER={MYSQL_CONFIG['user']}, "
+        f"MYSQL_DATABASE={MYSQL_CONFIG['database']}. "
+        "Check that MySQL is running and that MYSQL_PASSWORD is the real "
+        "password for this user."
+    )
+
+
+def init_db():
+    with DB_LOCK:
+        database = mysql_database_name()
+        try:
+            connection = get_connection()
+        except pymysql.err.OperationalError as exc:
+            if exc.args and exc.args[0] == 1049:
+                try:
+                    create_database(database)
+                    connection = get_connection()
+                except pymysql.err.OperationalError as create_exc:
+                    raise RuntimeError(connection_error_message(create_exc)) from create_exc
+            else:
+                raise RuntimeError(connection_error_message(exc)) from exc
+
         cursor = connection.cursor()
-        cursor.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS users (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                username VARCHAR(24) NOT NULL UNIQUE,
-                password_hash CHAR(64) NOT NULL,
-                password_salt CHAR(32) NOT NULL,
-                elo INT NOT NULL DEFAULT {STARTING_ELO},
-                multiplayer_wins INT NOT NULL DEFAULT 0,
-                multiplayer_losses INT NOT NULL DEFAULT 0,
-                multiplayer_draws INT NOT NULL DEFAULT 0,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-            """
-        )
-        ensure_user_columns(cursor)
-        cursor.execute(
-            """
-            CREATE TABLE IF NOT EXISTS user_stats (
-                user_id INT NOT NULL,
-                opponent VARCHAR(16) NOT NULL,
-                wins INT NOT NULL DEFAULT 0,
-                losses INT NOT NULL DEFAULT 0,
-                draws INT NOT NULL DEFAULT 0,
-                PRIMARY KEY (user_id, opponent),
-                CONSTRAINT fk_user_stats_user
-                    FOREIGN KEY (user_id) REFERENCES users(id)
-                    ON DELETE CASCADE
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-            """
-        )
-        cursor.execute(
-            """
-            CREATE TABLE IF NOT EXISTS game_history (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                mode VARCHAR(32) NOT NULL,
-                white_user_id INT NULL,
-                black_user_id INT NULL,
-                white_username VARCHAR(24) NOT NULL,
-                black_username VARCHAR(24) NOT NULL,
-                result VARCHAR(16) NOT NULL,
-                result_label VARCHAR(120) NOT NULL,
-                termination VARCHAR(32) NOT NULL,
-                moves_json JSON NOT NULL,
-                white_elo_before INT NULL,
-                white_elo_after INT NULL,
-                white_elo_change INT NULL,
-                black_elo_before INT NULL,
-                black_elo_after INT NULL,
-                black_elo_change INT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                INDEX idx_game_history_white_user (white_user_id),
-                INDEX idx_game_history_black_user (black_user_id),
-                CONSTRAINT fk_game_history_white_user
-                    FOREIGN KEY (white_user_id) REFERENCES users(id)
-                    ON DELETE SET NULL,
-                CONSTRAINT fk_game_history_black_user
-                    FOREIGN KEY (black_user_id) REFERENCES users(id)
-                    ON DELETE SET NULL
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-            """
-        )
-        connection.commit()
-        connection.close()
+        try:
+            cursor.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS users (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    username VARCHAR(24) NOT NULL UNIQUE,
+                    password_hash CHAR(64) NOT NULL,
+                    password_salt CHAR(32) NOT NULL,
+                    elo INT NOT NULL DEFAULT {STARTING_ELO},
+                    multiplayer_wins INT NOT NULL DEFAULT 0,
+                    multiplayer_losses INT NOT NULL DEFAULT 0,
+                    multiplayer_draws INT NOT NULL DEFAULT 0,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """
+            )
+            ensure_user_columns(cursor)
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS user_stats (
+                    user_id INT NOT NULL,
+                    opponent VARCHAR(16) NOT NULL,
+                    wins INT NOT NULL DEFAULT 0,
+                    losses INT NOT NULL DEFAULT 0,
+                    draws INT NOT NULL DEFAULT 0,
+                    PRIMARY KEY (user_id, opponent),
+                    CONSTRAINT fk_user_stats_user
+                        FOREIGN KEY (user_id) REFERENCES users(id)
+                        ON DELETE CASCADE
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS game_history (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    mode VARCHAR(32) NOT NULL,
+                    white_user_id INT NULL,
+                    black_user_id INT NULL,
+                    white_username VARCHAR(24) NOT NULL,
+                    black_username VARCHAR(24) NOT NULL,
+                    result VARCHAR(16) NOT NULL,
+                    result_label VARCHAR(120) NOT NULL,
+                    termination VARCHAR(32) NOT NULL,
+                    moves_json JSON NOT NULL,
+                    white_elo_before INT NULL,
+                    white_elo_after INT NULL,
+                    white_elo_change INT NULL,
+                    black_elo_before INT NULL,
+                    black_elo_after INT NULL,
+                    black_elo_change INT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    INDEX idx_game_history_white_user (white_user_id),
+                    INDEX idx_game_history_black_user (black_user_id),
+                    CONSTRAINT fk_game_history_white_user
+                        FOREIGN KEY (white_user_id) REFERENCES users(id)
+                        ON DELETE SET NULL,
+                    CONSTRAINT fk_game_history_black_user
+                        FOREIGN KEY (black_user_id) REFERENCES users(id)
+                        ON DELETE SET NULL
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """
+            )
+            connection.commit()
+        finally:
+            connection.close()
 
 
 def ensure_user_columns(cursor):

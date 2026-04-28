@@ -2,6 +2,7 @@
 __pycache__/
 .DS_Store
 .env
+app/data/*.db
 app/data/models/*.pt
 app/data/models/*.npz
 app/data/mysql_data/

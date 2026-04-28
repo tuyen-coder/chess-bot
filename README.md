@@ -1,6 +1,6 @@
 # AI Chess Assignment
 
-This project is a chess game built with `tkinter`, `python-chess`, and two AI approaches:
+This project is a chess game built with `tkinter`, `FastAPI`, `python-chess`, and two AI approaches:
 
 - a classic minimax agent with alpha-beta pruning
 - a neural-network-based agent trained from self-play with MCTS
@@ -42,8 +42,8 @@ The web app includes account login, bot game modes, online matchmaking, Elo trac
 - `app/engine/chess_engine.py`: board state wrapper around `python-chess`
 - `app/engine/minimax.py`: random agent and minimax agent
 - `app/ml/model.py`: neural network, MCTS, self-play training, checkpointing
-- `app/web/app.py`: web server launcher
-- `app/web/handler.py`: HTTP request routing and API responses
+- `app/web/app.py`: FastAPI app setup and Uvicorn server launcher
+- `app/web/handler.py`: FastAPI routes and API responses
 - `app/web/controllers.py`: local game controller logic
 - `app/web/online.py`: online matchmaking and match state
 - `app/web/sessions.py`: in-memory sessions and matchmaking queue

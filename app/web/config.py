@@ -3,6 +3,10 @@ from pathlib import Path
 
 import chess
 
+from app.web.env import load_env_file
+
+load_env_file()
+
 HOST = os.getenv("WEB_HOST", "127.0.0.1")
 PORT = int(os.getenv("WEB_PORT", "8000"))
 AI_DELAY_MS = 800

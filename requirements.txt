@@ -1,5 +1,7 @@
 numpy
 PyMySQL
 cryptography
+fastapi
 python-chess
 torch
+uvicorn[standard]
