@@ -28,9 +28,26 @@ services:
       MYSQL_DATABASE: ${MYSQL_DATABASE}
     ports:
       - "8000:8000"
+    volumes:
+      - ./app/data/models:/app/app/data/models
     depends_on:
       db:
         condition: service_healthy
+
+  trainer:
+    build: .
+    command: ["python3", "-m", "app.ml.train"]
+    profiles:
+      - trainer
+    environment:
+      TRAIN_GAMES: ${TRAIN_GAMES:-96}
+      TRAIN_SIMULATIONS: ${TRAIN_SIMULATIONS:-200}
+      TRAIN_EPOCHS: ${TRAIN_EPOCHS:-5}
+      TRAIN_FORCE_RETRAIN: ${TRAIN_FORCE_RETRAIN:-0}
+      TRAIN_RESUME: ${TRAIN_RESUME:-1}
+      TRAIN_CHECKPOINT_PATH: /app/app/data/models/ml_model.pt
+    volumes:
+      - ./app/data/models:/app/app/data/models
 
 volumes:
   mysql_data:

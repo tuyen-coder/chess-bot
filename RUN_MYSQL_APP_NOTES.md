@@ -43,6 +43,23 @@ cd /Users/lannguyen/Downloads/AI-Assignment-2-main
 docker compose up --build
 ```
 
+Train or continue training the ML chess model:
+
+```bash
+docker compose --profile trainer run --rm trainer
+```
+
+Optional training settings:
+
+```bash
+TRAIN_GAMES=24 \
+TRAIN_SIMULATIONS=80 \
+TRAIN_EPOCHS=2 \
+docker compose --profile trainer run --rm trainer
+```
+
+The trainer writes checkpoints to `app/data/models`, which is mounted into the web container too.
+
 Open:
 
 ```text
